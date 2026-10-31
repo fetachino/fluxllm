@@ -157,10 +157,17 @@ async def _stream_completion_sse(
     created = int(time.time())
     completion_id = f"cmpl-{handle.request.request_id[:24]}"
     previous = ""
+    streamed_ids: list[int] = []
     try:
         async for event in handle.stream():
             if event.type == "token":
-                full = app.state.detokenize(handle.request.generated_token_ids)
+                # Accumulate ids from the events themselves: the request's
+                # shared generated_token_ids can race ahead of event
+                # consumption (the engine keeps sampling), which would fuse
+                # or drop streamed pieces.
+                if event.token_id is not None:
+                    streamed_ids.append(event.token_id)
+                full = app.state.detokenize(streamed_ids)
                 piece = full[len(previous) :] if full.startswith(previous) else full
                 previous = full
                 if piece:
@@ -205,10 +212,15 @@ async def _stream_chat_sse(app: FastAPI, handle: RequestHandle) -> AsyncIterator
     created = int(time.time())
     completion_id = f"chatcmpl-{handle.request.request_id[:24]}"
     previous = ""
+    streamed_ids: list[int] = []
     try:
         async for event in handle.stream():
             if event.type == "token":
-                full = app.state.detokenize(handle.request.generated_token_ids)
+                # Same race-avoidance as the completion stream: accumulate
+                # ids per consumed event instead of reading shared state.
+                if event.token_id is not None:
+                    streamed_ids.append(event.token_id)
+                full = app.state.detokenize(streamed_ids)
                 piece = full[len(previous) :] if full.startswith(previous) else full
                 previous = full
                 if piece:

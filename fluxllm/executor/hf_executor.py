@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Sequence
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
 
 from fluxllm.executor.base import SequenceState, StepOutput
 from fluxllm.executor.device import detect_device, resolve_dtype
@@ -53,7 +53,9 @@ class HFModelExecutor:
             dtype=self.dtype,
             trust_remote_code=trust_remote_code,
         )
-        self.model.to(self.device)  # type: ignore[arg-type]
+        # transformers 5.x wraps Module.to; its typing stubs resolve poorly
+        # across versions and platforms, so route through Any explicitly.
+        cast(Any, self.model).to(self.device)
         self.model.eval()
 
         config = self.model.config
