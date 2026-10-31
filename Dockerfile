@@ -14,12 +14,14 @@ RUN groupadd --system fluxllm && useradd --system --gid fluxllm fluxllm \
     && mkdir -p /models-cache /app && chown -R fluxllm:fluxllm /models-cache /app
 
 # CPU-only PyTorch wheel index keeps the image ~1.5GB instead of pulling CUDA.
+# torch is installed first from the CPU index; the torch extra then pulls its
+# remaining members (transformers, accelerate, safetensors) without re-installing torch.
 RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
 
 COPY pyproject.toml README.md ./
 COPY fluxllm ./fluxllm
 COPY demo ./demo
-RUN pip install --no-cache-dir -e ".[api]"
+RUN pip install --no-cache-dir -e ".[api,torch]"
 
 USER fluxllm
 

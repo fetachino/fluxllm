@@ -18,10 +18,13 @@ jobs:
         with:
           python-version: "3.11"
       - name: Install package with CPU torch
+        # torch comes from the CPU wheel index first; the torch extra then
+        # installs its other members (transformers, accelerate, safetensors)
+        # without pulling a CUDA torch replacement.
         run: |
           pip install --upgrade pip
           pip install torch --index-url https://download.pytorch.org/whl/cpu
-          pip install -e ".[api,dev]"
+          pip install -e ".[api,torch,dev]"
       - name: Run real-model integration tests
         env:
           FLUXLLM_INTEGRATION: "1"
