@@ -50,7 +50,7 @@ class HFModelExecutor:
         )
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name,
-            torch_dtype=self.dtype,
+            dtype=self.dtype,
             trust_remote_code=trust_remote_code,
         )
         self.model.to(self.device)  # type: ignore[arg-type]

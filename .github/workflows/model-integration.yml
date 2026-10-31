@@ -1,0 +1,29 @@
+name: model-integration
+
+# Optional slow job exercising the engine against a real Hugging Face
+# model on a CPU runner. Not required for everyday PR validation: run on
+# demand or weekly so model drift/indexing changes do not break silently.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 6 * * 1"
+
+jobs:
+  hf-engine:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install package with CPU torch
+        run: |
+          pip install --upgrade pip
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -e ".[api,dev]"
+      - name: Run real-model integration tests
+        env:
+          FLUXLLM_INTEGRATION: "1"
+          FLUXLLM_TEST_MODEL: "Qwen/Qwen2.5-0.5B-Instruct"
+        run: pytest tests/integration tests/unit -q --tb=short

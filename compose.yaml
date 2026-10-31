@@ -1,0 +1,43 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: api
+    image: fluxllm-api:local
+    restart: unless-stopped
+    init: true
+    user: "1001:1001"
+    read_only: true
+    tmpfs:
+      - /tmp
+    environment:
+      FLUXLLM_MODEL_NAME: ${FLUXLLM_MODEL_NAME:-Qwen/Qwen2.5-0.5B-Instruct}
+      FLUXLLM_DTYPE: ${FLUXLLM_DTYPE:-float32}
+      FLUXLLM_DEVICE: ${FLUXLLM_DEVICE:-auto}
+      FLUXLLM_MAX_BATCH_SIZE: ${FLUXLLM_MAX_BATCH_SIZE:-4}
+      FLUXLLM_NUM_BLOCKS: ${FLUXLLM_NUM_BLOCKS:-256}
+      FLUXLLM_BLOCK_SIZE: ${FLUXLLM_BLOCK_SIZE:-16}
+      FLUXLLM_MAX_QUEUE_SIZE: ${FLUXLLM_MAX_QUEUE_SIZE:-64}
+      FLUXLLM_MAX_NEW_TOKENS: ${FLUXLLM_MAX_NEW_TOKENS:-128}
+      FLUXLLM_MAX_PROMPT_TOKENS: ${FLUXLLM_MAX_PROMPT_TOKENS:-512}
+      FLUXLLM_LOG_LEVEL: ${FLUXLLM_LOG_LEVEL:-INFO}
+      HOME: /tmp
+      HF_HOME: /models-cache
+    volumes:
+      - hf-cache:/models-cache
+    ports:
+      - "${FLUXLLM_API_PORT:-8000}:8000"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=4)"
+      interval: 30s
+      timeout: 5s
+      start_period: 180s
+      retries: 5
+
+volumes:
+  hf-cache:
