@@ -168,3 +168,34 @@ async def test_preempted_request_recovers_without_duplication_under_pressure(
         assert len(handle.request.generated_token_ids) == len(tokens)
     assert engine.block_manager.used_blocks == 0
     await engine.aclose()
+
+
+async def test_repeat_prompts_reuse_prefix_blocks(engine_factory):
+    """Identical prompts served back-to-back share full prefix blocks."""
+    engine = engine_factory(num_blocks=16, block_size=4, max_new_tokens=2)
+    engine.start()
+    for _ in range(2):
+        handle = engine.submit("alpha beta gamma delta", SamplingParams(max_new_tokens=2))
+        await tokens_of(handle)
+    cache = engine.block_manager.prefix_cache
+    assert cache is not None
+    assert cache.hits >= 1
+    assert cache.reused_tokens > 0
+    await engine.aclose()
+
+
+async def test_back_to_back_engines_stream_normally(engine_factory):
+    """Regression: cross-engine metrics state must never strand admissions.
+
+    Repeated engine builds in one process (tests, API reloads) share the
+    metrics singleton while each block manager restarts its counters at
+    zero. With per-event prefix recording, every engine must stream.
+    """
+    for _ in range(2):
+        engine = engine_factory(num_blocks=8, block_size=4, max_new_tokens=4)
+        engine.start()
+        handle = engine.submit("alpha beta gamma delta epsilon", SamplingParams(max_new_tokens=4))
+        events = await asyncio.wait_for(tokens_of(handle), timeout=10)
+        assert len(events) == 4
+        assert handle.request.state is RequestState.COMPLETED
+        await engine.aclose()

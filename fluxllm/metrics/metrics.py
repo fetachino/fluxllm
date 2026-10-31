@@ -104,6 +104,26 @@ class EngineMetrics:
             "Fraction of the logical KV block pool in use",
             registry=self.registry,
         )
+        self.prefix_hits = Counter(
+            "fluxllm_prefix_cache_hits_total",
+            "Prefix-cache block reuse events observed by the manager",
+            registry=self.registry,
+        )
+        self.prefix_misses = Counter(
+            "fluxllm_prefix_cache_misses_total",
+            "Blocks allocated fresh while the prefix cache was enabled",
+            registry=self.registry,
+        )
+        self.prefix_reused_tokens = Counter(
+            "fluxllm_prefix_cache_reused_tokens_total",
+            "Prompt tokens served from pooled block reuse",
+            registry=self.registry,
+        )
+        self.prefix_hit_rate = Gauge(
+            "fluxllm_prefix_cache_hit_rate",
+            "Fraction of prefix-cache block lookups served from cache",
+            registry=self.registry,
+        )
 
         # -- latency histograms ---------------------------------------------------
         self._prefill = Histogram(
@@ -146,6 +166,22 @@ class EngineMetrics:
         self.kv_blocks_used.set(block_manager.used_blocks)
         self.kv_blocks_free.set(block_manager.free_blocks)
         self.kv_cache_utilization.set(block_manager.utilization)
+        # Gauge only: prefix counters are recorded per allocation event
+        # (on_prefix_hit/on_prefix_miss), never from snapshot deltas — a new
+        # engine's block manager resets its snapshot while this singleton
+        # persists, so deltas would go negative across engines.
+        self.prefix_hit_rate.set(
+            block_manager.prefix_cache.hit_rate if block_manager.prefix_cache is not None else 0.0
+        )
+
+    def on_prefix_hit(self, reused_tokens: int) -> None:
+        """One block was shared from the prefix cache (allocation-time event)."""
+        self.prefix_hits.inc()
+        self.prefix_reused_tokens.inc(reused_tokens)
+
+    def on_prefix_miss(self) -> None:
+        """One block was allocated fresh while prefix caching was enabled."""
+        self.prefix_misses.inc()
 
     def set_queue_depth(self, depth: int) -> None:
         self.queue_depth.set(depth)

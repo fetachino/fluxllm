@@ -146,7 +146,13 @@ class FluxEngine:
         tokenizer = _make_tokenizer(settings)
         if executor is None:
             executor = _make_executor(settings)
-        blocks = BlockManager(num_blocks=settings.num_blocks, block_size=settings.block_size)
+        blocks = BlockManager(
+            num_blocks=settings.num_blocks,
+            block_size=settings.block_size,
+            enable_prefix_cache=settings.enable_prefix_cache,
+            # Per-event prefix metrics (same singleton the engine reports to).
+            prefix_metrics=global_metrics,
+        )
         limits = SchedulerLimits(
             max_batch_size=settings.max_batch_size,
             max_num_batched_tokens=settings.max_num_batched_tokens,
@@ -287,8 +293,6 @@ class FluxEngine:
 
     async def _run_iteration(self) -> bool:
         plan = self.scheduler.plan()
-        self.metrics.on_iteration(self.scheduler.batch_size(), self.block_manager)
-
         for request in plan.prefills:
             await self._prefill_step(request)
         for request in plan.decodes:
@@ -296,6 +300,9 @@ class FluxEngine:
             if runtime is None or runtime.pending_logits is None:
                 continue
             await self._decode_step(request)
+        # Telemetry after committed work: plan() already admitted sequences,
+        # so a metrics failure must never strand their prefills.
+        self.metrics.on_iteration(self.scheduler.batch_size(), self.block_manager)
         return bool(plan.prefills) or bool(plan.decodes)
 
     # -- step execution ------------------------------------------------------
