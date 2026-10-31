@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 # FluxLLM API image. CPU-only torch keeps the image broadly deployable
 # (Coolify, plain Docker, CI); larger GPU models run on CUDA hosts natively.
-FROM python:3.11-slim AS base
+FROM python:3.11-slim AS api
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -32,7 +32,7 @@ CMD ["uvicorn", "fluxllm.api.app:app", "--host", "0.0.0.0", "--port", "8000"]
 
 # -----
 # Benchmark image: same runtime plus the benchmark harness and matplotlib.
-FROM base AS benchmark
+FROM api AS benchmark
 
 USER root
 COPY benchmarks ./benchmarks
