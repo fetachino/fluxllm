@@ -18,6 +18,7 @@ RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/wh
 
 COPY pyproject.toml README.md ./
 COPY fluxllm ./fluxllm
+COPY demo ./demo
 RUN pip install --no-cache-dir -e ".[api]"
 
 USER fluxllm

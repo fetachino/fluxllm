@@ -30,6 +30,8 @@ def create_app(settings: EngineSettings | None = None) -> FastAPI:
     _configure_logging(settings.log_level)
     logger = logging.getLogger(__name__)
 
+    from fluxllm.api.demo import mount_demo
+
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         from fluxllm.engine.engine import FluxEngine
@@ -66,6 +68,8 @@ def create_app(settings: EngineSettings | None = None) -> FastAPI:
         lifespan=lifespan,
     )
     app.include_router(router)
+    if mount_demo(app):
+        logger.info("demo page mounted at /demo")
     return app
 
 

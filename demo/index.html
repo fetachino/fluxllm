@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>FluxLLM — live demo</title>
+  <link rel="stylesheet" href="/demo/styles.css" />
+</head>
+<body>
+  <header>
+    <h1>FluxLLM <span class="tag">live demo</span></h1>
+    <div id="health" class="chip neutral">checking…</div>
+  </header>
+
+  <main>
+    <!-- Single request: streaming generation with visible TTFT -->
+    <section class="panel">
+      <h2>Single request</h2>
+      <label for="prompt">Prompt</label>
+      <textarea id="prompt" rows="3"
+        >Summarize in two short sentences what continuous batching gives an inference server.</textarea>
+
+      <div class="params">
+        <label>max_tokens <input id="maxTokens" type="number" value="24" min="1" max="128" /></label>
+        <label>temperature <input id="temp" type="number" value="0.2" step="0.1" min="0" max="2" /></label>
+        <label>seed <input id="seed" type="number" placeholder="(random)" /></label>
+        <button id="send">Generate</button>
+        <button id="stop" disabled>Stop</button>
+      </div>
+
+      <div id="output" class="output" aria-live="polite"></div>
+
+      <div class="chips">
+        <span class="chip" id="chipTtft">TTFT —</span>
+        <span class="chip" id="chipChunks">pieces —</span>
+        <span class="chip" id="chipRate">rate —</span>
+        <span class="chip" id="chipFinish">finish —</span>
+      </div>
+    </section>
+
+    <!-- Live engine state -->
+    <section class="panel">
+      <h2>Engine</h2>
+      <div class="statgrid">
+        <div class="stat"><b id="queued">—</b><span>queued</span></div>
+        <div class="stat"><b id="running">—</b><span>running</span></div>
+        <div class="stat"><b id="batch">—</b><span>batch size</span></div>
+        <div class="stat"><b id="iterations">—</b><span>iterations</span></div>
+        <div class="stat"><b id="admitted">—</b><span>admitted</span></div>
+        <div class="stat"><b id="preempted">—</b><span>preempted</span></div>
+      </div>
+
+      <div class="kv">
+        <div class="kvhead">
+          KV blocks <span id="blocksUsed">—</span>
+        </div>
+        <div class="bar"><div class="fill" id="kvBar"></div></div>
+        <div class="ministats">
+          <span id="kvUtil">—</span> utilization&nbsp;·&nbsp;
+          <span id="genTokens">—</span> tokens generated&nbsp;·&nbsp;
+          <span id="prefixRate">—</span> prefix hit rate
+        </div>
+      </div>
+
+      <!-- Burst panel: shows arrivals joining mid-decode -->
+      <h2>4-way burst (continuous batching)</h2>
+      <p class="hint">
+        Four requests are sent at once. Watch the engine panel: each arrival is
+        admitted and prefilled while earlier requests are still decoding — no
+        wait-for-batch-drain.
+      </p>
+      <div id="lanes"></div>
+      <button id="burst">Run burst</button>
+    </section>
+  </main>
+
+  <footer>
+    <span id="footerNote">
+      Output produced by the configured FluxLLM engine; the demo page is a thin
+      client over the OpenAI-compatible HTTP API.
+    </span>
+  </footer>
+
+  <script src="/demo/app.js"></script>
+</body>
+</html>

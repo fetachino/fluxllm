@@ -1,0 +1,184 @@
+:root {
+  --bg: #f6f7fb;
+  --panel: #ffffff;
+  --ink: #1f2937;
+  --muted: #6b7280;
+  --line: #e5e7eb;
+  --accent: #2563eb;
+  --accent-soft: #dbeafe;
+  --warn: #b45309;
+  --ok: #047857;
+  --mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 15px/1.5 ui-sans-serif, system-ui, "Segoe UI", Roboto, sans-serif;
+}
+
+header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 22px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+}
+
+header h1 { margin: 0; font-size: 20px; }
+header .tag {
+  color: var(--muted);
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+main {
+  display: grid;
+  grid-template-columns: minmax(380px, 46%) 1fr;
+  gap: 18px;
+  padding: 18px 22px;
+  align-items: start;
+}
+
+@media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 16px 18px;
+}
+
+.panel h2 {
+  margin: 0 0 10px;
+  font-size: 14px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+}
+
+.panel h2 + .hint { margin-top: -6px; }
+
+label { font-size: 13px; color: var(--muted); display: block; }
+textarea {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px;
+  font: inherit;
+  resize: vertical;
+}
+
+.params {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin: 12px 0;
+}
+.params label { display: flex; gap: 6px; align-items: center; }
+.params input[type="number"] {
+  width: 76px;
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font: var(--mono) 13px;
+}
+
+button {
+  border: 1px solid var(--accent);
+  background: var(--accent);
+  color: #fff;
+  border-radius: 8px;
+  padding: 8px 16px;
+  font: inherit;
+  cursor: pointer;
+}
+button:disabled { background: var(--accent-soft); border-color: var(--accent-soft); color: var(--accent); }
+button.secondary { background: #fff; color: var(--accent); }
+
+.output {
+  min-height: 120px;
+  background: #fafafa;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 12px;
+  white-space: pre-wrap;
+  font: var(--mono) 13px;
+}
+
+.chips { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+.chip {
+  font: var(--mono) 12px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: #fff;
+  color: var(--ink);
+}
+.chip.neutral { color: var(--muted); }
+.chip.good { border-color: #a7f3d0; background: #ecfdf5; color: var(--ok); }
+.chip.bad { border-color: #fecaca; background: #fef2f2; color: #b91c1c; }
+
+.statgrid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
+  margin-bottom: 14px;
+}
+.stat {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 10px;
+  text-align: center;
+}
+.stat b { display: block; font-size: 20px; font-family: var(--mono); }
+.stat span { font-size: 11px; color: var(--muted); letter-spacing: 0.04em; text-transform: uppercase; }
+
+.kvhead { font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+.bar {
+  height: 10px;
+  background: var(--line);
+  border-radius: 999px;
+  overflow: hidden;
+  position: relative;
+}
+.bar .fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 0%;
+  background: var(--accent);
+  border-radius: 999px;
+}
+.ministats { font: var(--mono) 12px; color: var(--muted); margin-top: 6px; }
+
+#lanes {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 10px 0;
+}
+.lane {
+  display: grid;
+  grid-template-columns: 70px 1fr 210px;
+  gap: 10px;
+  align-items: center;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+.lane .num { font: var(--mono) 13px; color: var(--muted); }
+.lane .out { font: var(--mono) 12px; min-height: 18px; max-height: 66px; overflow: hidden; white-space: pre-wrap; }
+.lane .meta { font: var(--mono) 12px; color: var(--muted); text-align: right; }
+.lane.done .num { color: var(--ok); }
+
+footer {
+  padding: 12px 22px;
+  color: var(--muted);
+  font-size: 12px;
+}
