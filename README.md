@@ -162,6 +162,7 @@ tests/integration/  real-model tests (env-gated)
 - [ROADMAP.md](ROADMAP.md) — planned work (batched attention kernels,
   continuous-flow tuning).
 - [SECURITY.md](SECURITY.md) — threat model and hardening.
+- [CHANGELOG.md](CHANGELOG.md) — release history; every entry maps to real commits and committed artifacts.
 - [docs/deployment.md](docs/deployment.md) — Docker, Compose, Coolify.
 - [docs/interview-guide.md](docs/interview-guide.md) — deep-dive talking
   points on every subsystem.
