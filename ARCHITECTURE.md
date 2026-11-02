@@ -25,6 +25,7 @@ fluxllm/
 │   ├── engine.py           FluxEngine: loop, submission, streaming, preemption
 │   ├── lifecycle.py        RequestState enum + transition validation
 │   ├── request.py          GenerationRequest + RequestTimings (TTFT etc.)
+│   ├── detokenizer.py      incremental stable text deltas for SSE
 │   └── tokens.py           deterministic simulation tokenizer (labeled)
 ├── executor/
 │   ├── base.py             ModelExecutor protocol + StepOutput/SequenceState
@@ -63,14 +64,17 @@ releases scheduler entries, executor KV state, and pool blocks exactly once
    request that does not fit blocks *everyone behind it* (strict FIFO is a
    documented policy, not an accident). Admitted requests are pre-allocated
    prompt blocks immediately.
-2. Prefills — for each newly admitted request, run the prefill forward in a
-   worker thread (`asyncio.to_thread`), record the executor state, then
-   sample the first token and stream it. TTFT is recorded here
-   (submission → first streamed token).
+2. Prefills — newly admitted requests run in a worker thread
+   (`asyncio.to_thread`). When more than one is ready, `prefill_batch` packs
+   them into one left-padded model forward; rows that share a cached prompt
+   prefix reuse its KV instead of recomputing it. The first token is sampled
+   and streamed for each request. TTFT is recorded here (submission → first
+   streamed token).
 3. Decodes — for every decoding sequence: sample from the pending logits,
    stream the token, reserve one KV slot (`block_manager.extend`), and feed
-   the token through one decode forward. Terminal tokens (EOS / stop ids)
-   append and finish without another forward.
+   the token through one decode forward. Ready sequences share a single
+   `decode_batch` forward. Terminal tokens (EOS / stop ids) append and
+   finish without another forward.
 4. If `extend` cannot fit the next slot, the engine rolls the token back
    (`unextend`), releases the sequence, re-queues it as preempted, and
    emits a preemption metric. A head request that can *never* fit (bigger
@@ -97,15 +101,26 @@ hashes (zlib.crc32 per block, cumulative chain keys). Reuse is implemented
 by refcount sharing: a matching incoming request is registered against the
 same block instead of renting a fresh one.
 
-**What this is NOT:** attention-kernel-level KV sharing. The HF executor
-keeps per-sequence KV tensors (transformers `DynamicCache`); two sequences
-sharing a block in the accounting layer still compute their own KV tensors.
-Consequences stated plainly: prefix reuse saves *pool capacity* (higher
-effective cache occupancy), not the compute to re-prefill shared prefixes.
-True PagedAttention-style sharing would require a paged KV allocator plus a
-batched attention kernel reading pages across sequences — deliberately
-future work. Every metric name (`fluxllm_prefix_cache_*`) says "accounting
-events" and the docs never borrow kernel-level claims.
+**Two layers of prefix reuse.** The block manager shares *capacity*:
+two sequences that match on a full block rent the same block. The HF
+executor separately shares *compute*: it keeps a small bounded LRU of
+cloned KV snapshots keyed by prompt token ids. A later prefill with an
+exact match returns the stored next-token logits (zero forwards), a shorter
+cached prefix forwards only the uncached tail, and a prompt that is a
+prefix of a cached longer prompt crops the cached KV and forwards one token.
+Snapshots are cloned, never shared, because decoding mutates a cache in
+place. This is executor-level compute reuse, observable via
+`fluxllm_prefix_compute_*`; it is orthogonal to the block pool's accounting.
+
+**What this is NOT:** paged attention. The HF executor still keeps
+per-sequence KV tensors (transformers `DynamicCache`); batched forwards
+gather rows into a left-padded batch and slice them back out, and two
+sequences sharing a block still own their own KV tensors. Batched decode is
+therefore model-forward batching, not a fused kernel reading pages across
+sequences. True PagedAttention-style sharing would require a paged KV
+allocator plus a batched attention kernel — deliberately future work. Every
+metric name says "accounting events" or "compute reuse" and the docs never
+borrow kernel-level claims.
 
 ## Sampling
 
@@ -118,15 +133,19 @@ noticed.
 
 `ModelExecutor` is intentionally minimal: `prefill(request_id, tokens)` →
 `StepOutput` (next-token logits + opaque `SequenceState`), `decode(state,
-last_token)`, `release(request_id)`. Two implementations:
+last_token)`, `release(request_id)`. The optional batch methods
+`prefill_batch` / `decode_batch` have the same per-row contract, so the
+engine can fall back to the sequential path without changing semantics. Two
+implementations:
 
-- `HFModelExecutor` — real PyTorch/transformers execution, per-sequence
-  `DynamicCache` so prompts are never recomputed during decoding; runs on
-  CPU or CUDA; documents the per-sequence decode scope note.
+- `HFModelExecutor` — real PyTorch/transformers execution with per-sequence
+  `DynamicCache`, left-padded batched forwards, and a bounded prefix-KV
+  snapshot store for compute reuse; runs on CPU or CUDA.
 - `DeterministicExecutor` — dependency-free numpy simulation whose logits
   pattern is fixed arithmetic, always clearly labeled as simulation (it
   powers unit tests, the CI fast lane, and demo/screen modes that must not
-  present fake model output as real).
+  present fake model output as real). It mirrors the batch and prefix-reuse
+  interfaces so the fast lane exercises the same engine paths.
 
 ## Metrics
 
@@ -135,7 +154,8 @@ One `EngineMetrics` instance (process-wide `global_metrics`) with the
 
 - counters: requests received/completed/cancelled/failed, preemptions,
   scheduler iterations, prompt/generated tokens, prefix-cache
-  hit/miss/reused-tokens;
+  hit/miss/reused-tokens, batched model forwards, prefix-compute reuses and
+  reused tokens;
 - gauges: queue depth, running requests, batch size, KV blocks
   used/free/utilization, prefix hit rate;
 - histograms: TTFT, inter-token latency, prefill latency, e2e latency.
@@ -161,10 +181,13 @@ per-engine snapshots reset while the singleton persists, and a negative
 
 - **Fast lane** (`pytest tests`, default): deterministic executor only, no
   model downloads, no GPU — runs in a few seconds and covers the engine,
-  scheduler, cache (including invariants), sampling, metrics, API, and SSE
-  race behavior.
+  scheduler, cache (including invariants), batched-path equivalence, prefix
+  reuse bookkeeping, sampling, metrics, API, SSE race behavior, and
+  incremental detokenization (including partial UTF-8).
 - **Integration lane** (`FLUXLLM_INTEGRATION=1`, weekly in CI): loads the
-  real Qwen model and checks real prefetch/stream/release behavior.
+  real Qwen model and checks real prefill/decode, batched-vs-sequential
+  equivalence, prefix-reuse logits against a cold prefill, streaming, and
+  resource release.
 - **Linux parity**: the CI-relevant paths were also verified in a local
   `python:3.11-slim` container (this caught a platform-only mypy failure
   and a streaming race that never reproduced on Windows).

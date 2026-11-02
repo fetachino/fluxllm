@@ -36,6 +36,17 @@ def make_charts(payload: dict) -> None:
     runs = payload["runs"]
     flux = [r for r in runs if r["mode"] == "fluxllm"]
     seq = [r for r in runs if r["mode"] == "sequential_transformers"]
+    batched = {
+        r["concurrency"]: r
+        for r in flux
+        if r.get("batched_execution", True) is not False
+    }
+    per_sequence = {
+        r["concurrency"]: r
+        for r in flux
+        if r.get("batched_execution") is False
+    }
+    levels = sorted({r["concurrency"] for r in flux})
     os.makedirs(OUT_DIR, exist_ok=True)
 
     env = payload["env"]
@@ -46,9 +57,32 @@ def make_charts(payload: dict) -> None:
 
     # -- throughput ----------------------------------------------------------
     fig, ax = plt.subplots(figsize=(7, 4.2))
-    levels = [r["concurrency"] for r in flux]
-    tps = [r["throughput_tokens_per_s"] for r in flux]
-    ax.bar([str(c) for c in levels], tps, color="#2563eb", label="FluxLLM (continuous batching)")
+    if per_sequence:
+        width = 0.38
+        xs = list(range(len(levels)))
+        ax.bar(
+            [x - width / 2 for x in xs],
+            [batched[c]["throughput_tokens_per_s"] for c in levels],
+            width,
+            color="#2563eb",
+            label="FluxLLM batched decode",
+        )
+        ax.bar(
+            [x + width / 2 for x in xs],
+            [per_sequence[c]["throughput_tokens_per_s"] for c in levels],
+            width,
+            color="#93c5fd",
+            label="FluxLLM per-sequence decode",
+        )
+        ax.set_xticks(xs)
+        ax.set_xticklabels([str(c) for c in levels])
+    else:
+        ax.bar(
+            [str(c) for c in levels],
+            [batched[c]["throughput_tokens_per_s"] for c in levels],
+            color="#2563eb",
+            label="FluxLLM (continuous batching)",
+        )
     if seq:
         baseline = seq[0]["throughput_tokens_per_s"]
         ax.axhline(baseline, color="#9ca3af", linestyle="--", linewidth=1.2,
@@ -63,25 +97,49 @@ def make_charts(payload: dict) -> None:
     print(f"wrote {path} from {len(runs)} runs")
 
     # -- TTFT ----------------------------------------------------------------
-    tt50 = [r["ttft_p50_seconds"] for r in flux if r["ttft_p50_seconds"] is not None]
-    tt95 = [r["ttft_p95_seconds"] for r in flux if r["ttft_p95_seconds"] is not None]
-    if tt50 and tt95:
-        fig, ax = plt.subplots(figsize=(7, 4.2))
-        shown_levels = levels[: len(tt50)]
-        width = 0.35
-        xs = range(len(shown_levels))
-        ax.bar([x - width / 2 for x in xs], tt50, width, color="#2563eb", label="TTFT p50")
-        ax.bar([x + width / 2 for x in xs], tt95, width, color="#93c5fd", label="TTFT p95")
-        ax.set_xticks(list(xs))
-        ax.set_xticklabels([str(c) for c in shown_levels])
-        ax.set_xlabel("concurrent requests")
-        ax.set_ylabel("time to first token (s)")
-        ax.set_title("TTFT by concurrency\n" + caption, fontsize=9)
-        ax.legend(fontsize=8)
-        fig.tight_layout()
-        path = os.path.join(OUT_DIR, "benchmark_ttft.png")
-        fig.savefig(path, dpi=150)
-        print(f"wrote {path}")
+    fig, ax = plt.subplots(figsize=(7, 4.2))
+    width = 0.35
+    xs = list(range(len(levels)))
+    if per_sequence:
+        ax.bar(
+            [x - width / 2 for x in xs],
+            [batched[c]["ttft_p50_seconds"] for c in levels],
+            width,
+            color="#2563eb",
+            label="batched TTFT p50",
+        )
+        ax.bar(
+            [x + width / 2 for x in xs],
+            [per_sequence[c]["ttft_p50_seconds"] for c in levels],
+            width,
+            color="#93c5fd",
+            label="per-sequence TTFT p50",
+        )
+    else:
+        ax.bar(
+            [x - width / 2 for x in xs],
+            [batched[c]["ttft_p50_seconds"] for c in levels],
+            width,
+            color="#2563eb",
+            label="TTFT p50",
+        )
+        ax.bar(
+            [x + width / 2 for x in xs],
+            [batched[c]["ttft_p95_seconds"] for c in levels],
+            width,
+            color="#93c5fd",
+            label="TTFT p95",
+        )
+    ax.set_xticks(xs)
+    ax.set_xticklabels([str(c) for c in levels])
+    ax.set_xlabel("concurrent requests")
+    ax.set_ylabel("time to first token (s)")
+    ax.set_title("TTFT by concurrency\n" + caption, fontsize=9)
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    path = os.path.join(OUT_DIR, "benchmark_ttft.png")
+    fig.savefig(path, dpi=150)
+    print(f"wrote {path}")
 
 
 def main() -> None:

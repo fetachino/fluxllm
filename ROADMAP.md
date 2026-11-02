@@ -6,25 +6,21 @@ Ordered by what would make the biggest honest difference. Items move to
 
 ## In progress / next
 
-- **Batched decode execution** — group all decoding sequences into one
-  forward where the executor supports it (padding + per-sequence KV with
-  position masking, kernel-level batching). This is the single biggest
-  throughput lever missing from FluxLLM: current per-sequence decode price
-  is documented in BENCHMARKS.md (flat aggregate throughput at
-  concurrency 1–8 on CPU).
-- **Prefix-cache compute reuse** — pair the existing accounting-level
-  reuse with executor-level shared prefill (at least skip re-prefilling
-  shared full blocks by extending from the shared KV state where the
-  executor supports it).
-- **Streaming token = one chunk, not detokenized text diff** — append
-  incremental decode (prefix-consistent incremental detokenizer) so
-  partial multibyte/merge situations stream cleanly.
-
-## Planned
-
+- **Paged-attention kernel** — the current batched path gathers per-sequence
+  KV into a left-padded batch and slices it back out every step. That is a
+  real gain (2.1× at concurrency 8 on CPU) but it plateaus beyond two rows
+  because gather/scatter and padding overhead grow with batch size. A fused
+  kernel reading pages across sequences is the next throughput lever, and it
+  will not be claimed before it is measured.
+- **Prefix-reuse throughput benchmark** — correctness and counters are
+  verified; measure the wall-clock win on repeated/shared-prefix traffic so
+  the claim is empirical rather than structural.
 - **Continuous-flow tuning** — per-iteration prefill budget rebalancing
   (priority tokens to prefill vs decode), preemption heuristics that
   consider time-remaining rather than strict FIFO only.
+
+## Planned
+
 - **More stop conditions** — stop strings (matching on decoded suffix),
   min-new-tokens, logit bias.
 - **Multi-model serve** — one process, several engines, per-model queues
@@ -39,6 +35,13 @@ Ordered by what would make the biggest honest difference. Items move to
   + KV-recompute, stall-fail path.
 - ✅ Block-based KV management with refcounts + invariants; logical
   prefix cache with honest accounting-level semantics.
+- ✅ Batched decode and prefill execution (`prefill_batch` /
+  `decode_batch`), with measured throughput in BENCHMARKS.md.
+- ✅ Executor-level prefix compute reuse: exact, partial-prefix, and
+  covering-prefix reuse with bounded LRU snapshots, metrics, and real-model
+  equivalence tests.
+- ✅ Incremental detokenizer for SSE: stable text deltas, held-back partial
+  multi-byte characters, finalize-on-stop.
 - ✅ OpenAI-compatible API including SSE streaming and
   disconnect-cancellation; race-free SSE piece diffing (fixed under Linux).
 - ✅ Prometheus metrics fed per event; /stats live snapshot.
@@ -51,7 +54,7 @@ Ordered by what would make the biggest honest difference. Items move to
 
 ## Non-goals
 
-- Claiming vLLM PagedAttention parity ever. The prefix cache is
-  accounting-level and documented as such.
+- Claiming vLLM PagedAttention parity ever. KV tensors are per sequence;
+  batching gathers rows into a padded batch and the docs say so.
 - Fabricated performance numbers, screenshots, or deployments. Nothing
   enters the docs before it is measured on the recorded environment.

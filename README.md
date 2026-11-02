@@ -24,10 +24,15 @@ engine panel shows scheduler and KV-cache state pulled from `/stats` and
   fixed-size logical blocks with refcounted ownership; capacity is checked
   *before* admission so the pool is never oversubscribed. A logical prefix
   cache reuses full prompt-prefix blocks across sequences via content-hash
-  chains (accounting-level; see honest-scope notes below).
+  chains, and the executor reuses cloned KV snapshots for shared prompt
+  prefixes so matching tokens are not recomputed.
+- **Batched model execution** — ready sequences in a scheduler iteration are
+  packed into one model forward per phase (`prefill_batch` / `decode_batch`)
+  instead of one forward per sequence.
 - **Streaming everywhere** — every generated token is an event on the
-  request's stream, surfaced as OpenAI-style SSE over HTTP, with client
-  disconnects cancelling the server-side request.
+  request's stream, surfaced as OpenAI-style SSE over HTTP. An incremental
+  detokenizer emits stable text deltas and holds back incomplete multi-byte
+  characters, with client disconnects cancelling the server-side request.
 - **OpenAI-compatible API** — `/v1/completions`, `/v1/chat/completions`
   (sync + streaming), `/health/live`, `/health/ready`, `/stats`, and
   Prometheus `/metrics`.
@@ -45,23 +50,28 @@ engine panel shows scheduler and KV-cache state pulled from `/stats` and
 
 This project optimizes for *understanding over pretending*:
 
-- **Decode forwards are per sequence**, not batched through an attention
-  kernel. Continuous batching operates at the scheduler level; production
-  engines (vLLM, TGI) also batch the attention computation across
-  sequences. This is the single biggest throughput lever and FluxLLM
-  documents it as future work rather than claiming it.
-- **The prefix cache is accounting-level.** Fewer blocks are rented when
-  prompts share prefixes; executor-side KV tensors are still per sequence.
-  Nothing here claims vLLM PagedAttention parity, and `ARCHITECTURE.md`
-  spells out the difference.
+- **Batched decode is model-forward batching, not a paged-attention
+  kernel.** Ready sequences share one `model(...)` call with per-row KV
+  gathered into a left-padded batch; attention still runs through
+  `transformers`' own kernel. Measured on the CPU dev machine, that lifts
+  aggregate throughput from 6.18 to 12.97 tok/s at concurrency 8 (2.1×) and
+  peaks at 15.67 tok/s at concurrency 2; it does not scale linearly, because
+  the gather/scatter and padding overhead grow with batch size. A fused
+  paged-attention kernel remains future work, and nothing here claims vLLM
+  PagedAttention parity.
+- **Prefix reuse has two layers.** The block manager shares *capacity*
+  (fewer blocks rented) and the executor shares *compute* (cloned KV
+  snapshots let a prefill skip matching prompt tokens), but KV tensors are
+  still per sequence, not paged. `ARCHITECTURE.md` spells out the
+  difference.
 - **The deterministic mode is a labeled simulation** (no real model
   output); it exists so tests and demos run in seconds without model
   downloads.
 - **Benchmarks are environment-specific and measured, never projected.**
-  On this repo's CPU dev machine, aggregate decode throughput is flat
-  across concurrency levels 1–8 (per-sequence decode, saturated torch
-  threads) — see [BENCHMARKS.md](BENCHMARKS.md) for the real numbers and
-  methodology.
+  Batched decode is a real, measured gain on this repo's CPU dev machine;
+  the per-sequence path is still flat across concurrency, and the batched
+  path plateaus beyond two rows. See [BENCHMARKS.md](BENCHMARKS.md) for the
+  raw numbers, the controlled comparison, and methodology.
 
 ## Quickstart
 
