@@ -148,11 +148,7 @@ class DeterministicExecutor:
         seq = tuple(int(t) for t in tokens)
         best: int | None = None
         for key in self._prefix_store:
-            if (
-                len(key) > len(seq)
-                and key[: len(seq)] == seq
-                and (best is None or len(key) < best)
-            ):
+            if len(key) > len(seq) and key[: len(seq)] == seq and (best is None or len(key) < best):
                 best = len(key)
         return best
 

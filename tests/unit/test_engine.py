@@ -42,23 +42,58 @@ async def test_single_request_completes(engine_factory):
 async def test_later_arrivals_share_engine_iterations(engine_factory):
     """Requests entering at different times must share execution.
 
-    The late request is admitted, prefilled, and finishes while the long
-    early request is still decoding — the defining behavior of continuous
-    batching (no wait-for-batch-drain).
+    The late request is admitted, prefilled, and decoded while the long
+    early request is still running — the defining behavior of continuous
+    batching (no wait-for-batch-drain). A gated executor pauses the first
+    decode batch so the late arrival is guaranteed to be enqueued while the
+    early request is mid-flight; the assertion is then structural (the two
+    ids appear in one batch), not a wall-clock race.
     """
-    engine = engine_factory(num_blocks=16, block_size=4, max_batch_size=4)
+    import threading
+
+    from fluxllm.executor.deterministic import DeterministicExecutor
+
+    class _GatedExecutor(DeterministicExecutor):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.batches: list[list[str]] = []
+            self.started = threading.Event()
+            self.resume = threading.Event()
+
+        def prefill(self, request_id, token_ids):
+            self.started.set()
+            return super().prefill(request_id, token_ids)
+
+        def decode(self, state, last_token):
+            self.batches.append([state.request_id])
+            self.started.set()
+            return super().decode(state, last_token)
+
+        def decode_batch(self, batch):
+            self.batches.append([state.request_id for state, _ in batch])
+            if not self.resume.is_set():
+                self.started.set()
+                self.resume.wait(timeout=5)
+            return super().decode_batch(batch)
+
+    executor = _GatedExecutor(vocab_size=32)
+    engine = engine_factory(num_blocks=16, block_size=4, max_batch_size=4, executor=executor)
     engine.start()
 
-    early = engine.submit("long running request", SamplingParams(max_new_tokens=30))
-    await asyncio.sleep(0.003)  # let the early request start decoding
-    late = engine.submit("late arrival", SamplingParams(max_new_tokens=8))
+    early = engine.submit("long running request", SamplingParams(max_new_tokens=50))
+    assert await asyncio.to_thread(executor.started.wait, 5), "engine never started"
+    late = engine.submit("late arrival", SamplingParams(max_new_tokens=4))
+    executor.resume.set()
 
     await asyncio.gather(tokens_of(early), tokens_of(late))
 
+    assert any(
+        early.request.request_id in batch and late.request.request_id in batch
+        for batch in executor.batches
+    ), f"no shared batch: {executor.batches}"
     assert late.request.timings.admitted_at is not None
-    assert late.request.timings.finished_at < early.request.timings.finished_at
-    # The late request was admitted while the early one was still running.
     assert late.request.timings.admitted_at < early.request.timings.finished_at
+    assert late.request.timings.finished_at < early.request.timings.finished_at
     assert engine.scheduler.total_preemptions == 0
     assert engine.block_manager.used_blocks == 0
     await engine.aclose()

@@ -238,9 +238,7 @@ def run_fluxllm(
             for prompt in prompts[:warmup]:
                 await one(prompt)
             start = time.perf_counter()
-            results = await asyncio.gather(
-                *(bounded(prompt) for prompt in prompts)
-            )
+            results = await asyncio.gather(*(bounded(prompt) for prompt in prompts))
             elapsed = time.perf_counter() - start
         finally:
             await engine.aclose()
@@ -335,17 +333,21 @@ def main() -> int:
         args.skip_sequential = True
         args.concurrency = [2]
 
-    print(f"env: {env_snapshot()['cpu_count']} cpus, "
-          f"threads={env_snapshot()['torch_threads']}, "
-          f"model={MODEL_NAME} (float32, cpu)")
+    print(
+        f"env: {env_snapshot()['cpu_count']} cpus, "
+        f"threads={env_snapshot()['torch_threads']}, "
+        f"model={MODEL_NAME} (float32, cpu)"
+    )
 
     runs: list[RunResult] = []
     if not args.skip_sequential:
         print("running sequential transformers baseline ...")
         runs.append(run_sequential_transformers(prompts, max_new_tokens, warmup=args.warmup))
         last = runs[-1]
-        print(f"  -> {last.total_tokens} tokens in {last.wall_seconds:.1f}s "
-              f"({last.throughput_tokens_per_s:.2f} tok/s)")
+        print(
+            f"  -> {last.total_tokens} tokens in {last.wall_seconds:.1f}s "
+            f"({last.throughput_tokens_per_s:.2f} tok/s)"
+        )
 
     for level in args.concurrency:
         variants = [True, False] if args.compare_batched else [args.batched]
@@ -353,9 +355,7 @@ def main() -> int:
             label = "batched" if batched else "per-sequence"
             print(f"running FluxLLM concurrency={level} ({label} decode) ...")
             runs.append(
-                run_fluxllm(
-                    prompts, max_new_tokens, level, warmup=args.warmup, batched=batched
-                )
+                run_fluxllm(prompts, max_new_tokens, level, warmup=args.warmup, batched=batched)
             )
             last = runs[-1]
             preemptions = last.preemptions

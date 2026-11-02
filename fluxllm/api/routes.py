@@ -185,9 +185,7 @@ async def _stream_completion_sse(
                             "object": "text_completion.chunk",
                             "created": created,
                             "model": "fluxllm",
-                            "choices": [
-                                {"index": 0, "text": tail, "finish_reason": None}
-                            ],
+                            "choices": [{"index": 0, "text": tail, "finish_reason": None}],
                         }
                     )
                 yield _sse(

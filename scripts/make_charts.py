@@ -36,16 +36,8 @@ def make_charts(payload: dict) -> None:
     runs = payload["runs"]
     flux = [r for r in runs if r["mode"] == "fluxllm"]
     seq = [r for r in runs if r["mode"] == "sequential_transformers"]
-    batched = {
-        r["concurrency"]: r
-        for r in flux
-        if r.get("batched_execution", True) is not False
-    }
-    per_sequence = {
-        r["concurrency"]: r
-        for r in flux
-        if r.get("batched_execution") is False
-    }
+    batched = {r["concurrency"]: r for r in flux if r.get("batched_execution", True) is not False}
+    per_sequence = {r["concurrency"]: r for r in flux if r.get("batched_execution") is False}
     levels = sorted({r["concurrency"] for r in flux})
     os.makedirs(OUT_DIR, exist_ok=True)
 
@@ -85,8 +77,13 @@ def make_charts(payload: dict) -> None:
         )
     if seq:
         baseline = seq[0]["throughput_tokens_per_s"]
-        ax.axhline(baseline, color="#9ca3af", linestyle="--", linewidth=1.2,
-                   label=f"sequential transformers baseline ({baseline:.2f} tok/s)")
+        ax.axhline(
+            baseline,
+            color="#9ca3af",
+            linestyle="--",
+            linewidth=1.2,
+            label=f"sequential transformers baseline ({baseline:.2f} tok/s)",
+        )
     ax.set_xlabel("concurrent requests")
     ax.set_ylabel("throughput (tokens/s)")
     ax.set_title("FluxLLM throughput vs concurrency\n" + caption, fontsize=9)

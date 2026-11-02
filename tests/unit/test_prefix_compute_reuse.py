@@ -77,9 +77,7 @@ def test_batch_prefill_reuses_per_row():
     metrics = EngineMetrics()
     executor = make_executor(metrics=metrics)
     executor.prefill("a", [1, 2, 3, 4])
-    outs = executor.prefill_batch(
-        [("b", [1, 2, 3, 4, 5]), ("c", [9, 9, 9])]
-    )
+    outs = executor.prefill_batch([("b", [1, 2, 3, 4, 5]), ("c", [9, 9, 9])])
     assert [out.state.num_tokens for out in outs] == [5, 3]
     assert metrics.prefix_compute_reuses._value.get() == 1
     assert metrics.prefix_compute_reused_tokens._value.get() == 4

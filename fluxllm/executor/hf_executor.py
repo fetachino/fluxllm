@@ -88,9 +88,7 @@ class HFModelExecutor:
         self._enable_prefix_reuse = enable_prefix_compute_reuse
         self._prefix_max_entries = max(1, prefix_kv_entries)
         self._prefix_max_tokens = max(1, prefix_kv_max_tokens)
-        self._prefix_store: OrderedDict[tuple[int, ...], tuple[Any, np.ndarray]] = (
-            OrderedDict()
-        )
+        self._prefix_store: OrderedDict[tuple[int, ...], tuple[Any, np.ndarray]] = OrderedDict()
         self._prefix_store_tokens = 0
         self._metrics = metrics
         # Cumulative tokens whose KV was reused instead of recomputed.
@@ -209,9 +207,7 @@ class HFModelExecutor:
             clone.update(k, v, layer_idx)
         return clone
 
-    def _remember_prefix(
-        self, tokens: Sequence[int], cache: Any, logits: np.ndarray
-    ) -> None:
+    def _remember_prefix(self, tokens: Sequence[int], cache: Any, logits: np.ndarray) -> None:
         if not self._enable_prefix_reuse:
             return
         key = tuple(int(t) for t in tokens)
@@ -229,9 +225,7 @@ class HFModelExecutor:
             old_key, _ = self._prefix_store.popitem(last=False)
             self._prefix_store_tokens -= len(old_key)
 
-    def _find_reusable_prefix(
-        self, tokens: Sequence[int]
-    ) -> tuple[int, Any, np.ndarray] | None:
+    def _find_reusable_prefix(self, tokens: Sequence[int]) -> tuple[int, Any, np.ndarray] | None:
         """Longest cached key that is a prefix of ``tokens``."""
         seq = tuple(int(t) for t in tokens)
         best: tuple[int, Any, np.ndarray] | None = None
@@ -278,9 +272,7 @@ class HFModelExecutor:
                 entry = {"hf_cache": cloned, "num_tokens": len(tokens)}
                 self._caches[request_id] = entry
                 if matched == len(tokens):
-                    state = SequenceState(
-                        request_id=request_id, num_tokens=len(tokens), kv=entry
-                    )
+                    state = SequenceState(request_id=request_id, num_tokens=len(tokens), kv=entry)
                     return (
                         StepOutput(
                             logits=logits.copy(),
@@ -389,9 +381,7 @@ class HFModelExecutor:
                 registered.append(request_id)
                 if reused_tokens:
                     reused.append((row, reused_tokens))
-                self._remember_prefix(
-                    tokens, self._caches[request_id]["hf_cache"], out.logits
-                )
+                self._remember_prefix(tokens, self._caches[request_id]["hf_cache"], out.logits)
             if cold:
                 cold_prompts = [prompts[i] for i in cold]
                 bsz = len(cold_prompts)
@@ -407,9 +397,7 @@ class HFModelExecutor:
                 position_ids = torch.zeros((bsz, max_prompt), dtype=torch.long)
                 for batch_row, (_, tokens) in enumerate(cold_prompts):
                     n = len(tokens)
-                    ids[batch_row, max_prompt - n :] = torch.tensor(
-                        list(tokens), dtype=torch.long
-                    )
+                    ids[batch_row, max_prompt - n :] = torch.tensor(list(tokens), dtype=torch.long)
                     attention[batch_row, max_prompt - n :] = 1
                     position_ids[batch_row, max_prompt - n :] = torch.arange(n)
                 with torch.inference_mode():
@@ -432,11 +420,7 @@ class HFModelExecutor:
                     registered.append(request_id)
                     state = SequenceState(request_id=request_id, num_tokens=n, kv=entry)
                     out = StepOutput(
-                        logits=outputs.logits[batch_row, -1, :]
-                        .float()
-                        .detach()
-                        .cpu()
-                        .numpy(),
+                        logits=outputs.logits[batch_row, -1, :].float().detach().cpu().numpy(),
                         state=state,
                         context_exceeded=n >= self._max_context_len,
                     )
