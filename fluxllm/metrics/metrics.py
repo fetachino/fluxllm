@@ -60,6 +60,16 @@ class EngineMetrics:
             "Continuous scheduling iterations executed",
             registry=self.registry,
         )
+        self.prefix_compute_reuses = Counter(
+            "fluxllm_prefix_compute_reuses_total",
+            "Prefills that reused executor-side KV from a cached prompt prefix",
+            registry=self.registry,
+        )
+        self.prefix_compute_reused_tokens = Counter(
+            "fluxllm_prefix_compute_reused_tokens_total",
+            "Prompt tokens whose KV was reused instead of recomputed",
+            registry=self.registry,
+        )
         self.batched_forwards = Counter(
             "fluxllm_batched_model_forwards",
             "Model forwards that executed multiple sequences at once, with "
@@ -199,6 +209,11 @@ class EngineMetrics:
         """One model forward advanced ``sequence_count`` sequences at once."""
         # Counter value doubles as total batched sequences executed.
         self.batched_forwards.inc(sequence_count)
+
+    def on_prefix_compute_reuse(self, reused_tokens: int) -> None:
+        """A prefill skipped ``reused_tokens`` tokens via a cached KV prefix."""
+        self.prefix_compute_reuses.inc()
+        self.prefix_compute_reused_tokens.inc(reused_tokens)
 
     # -- latency recording ---------------------------------------------------
     def record_ttft(self, timings: RequestTimings) -> None:

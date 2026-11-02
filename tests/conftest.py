@@ -24,6 +24,7 @@ def engine_factory():
         vocab_size: int = 32,
         eos_token_id: int | None = None,
         enable_batched_execution: bool = True,
+        enable_prefix_compute_reuse: bool = True,
     ) -> FluxEngine:
         settings = EngineSettings(
             deterministic=True,
@@ -39,7 +40,11 @@ def engine_factory():
         )
         engine = FluxEngine.from_settings(
             settings,
-            executor=DeterministicExecutor(vocab_size=vocab_size, eos_token_id=eos_token_id),
+            executor=DeterministicExecutor(
+                vocab_size=vocab_size,
+                eos_token_id=eos_token_id,
+                enable_prefix_compute_reuse=enable_prefix_compute_reuse,
+            ),
         )
         return engine
 

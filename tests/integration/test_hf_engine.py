@@ -93,10 +93,15 @@ async def _consume(handle) -> None:
         pass
 
 
-def _make_executor():
+def _make_executor(enable_prefix_compute_reuse: bool = False):
     from fluxllm.executor.hf_executor import HFModelExecutor
 
-    return HFModelExecutor(model_name=MODEL, dtype="float32", device="cpu")
+    return HFModelExecutor(
+        model_name=MODEL,
+        dtype="float32",
+        device="cpu",
+        enable_prefix_compute_reuse=enable_prefix_compute_reuse,
+    )
 
 
 def test_hf_batched_decode_matches_sequential():
@@ -171,3 +176,115 @@ def test_hf_batched_prefill_matches_sequential():
         executor.release("0")
         executor.release("1")
         executor.release("2")
+
+
+# -- executor-level prefix compute reuse -------------------------------------
+
+
+def _clear_prefix_store(executor) -> None:
+    executor._prefix_store.clear()
+    executor._prefix_store_tokens = 0
+
+
+def test_hf_prefix_reuse_exact_match_matches_cold_prefill():
+    import numpy as np
+
+    from fluxllm.executor.hf_executor import HFModelExecutor
+    from fluxllm.metrics.metrics import EngineMetrics
+
+    metrics = EngineMetrics()
+    executor = HFModelExecutor(
+        model_name=MODEL,
+        dtype="float32",
+        device="cpu",
+        enable_prefix_compute_reuse=True,
+        metrics=metrics,
+    )
+    ids = executor.encode("The capital of France is")
+    try:
+        cold = executor.prefill("cold", ids)
+        cold_logits = cold.logits.copy()
+        cold_stream = [int(cold.logits.argmax())]
+        state = cold.state
+        for _ in range(3):
+            out = executor.decode(state, cold_stream[-1])
+            state = out.state
+            cold_stream.append(int(out.logits.argmax()))
+        executor.release("cold")
+        assert executor.prefix_reused_tokens == 0
+
+        warm = executor.prefill("warm", ids)
+        assert executor.prefix_reused_tokens == len(ids)
+        assert metrics.prefix_compute_reuses._value.get() == 1
+        assert metrics.prefix_compute_reused_tokens._value.get() == len(ids)
+        np.testing.assert_allclose(warm.logits, cold_logits, atol=1e-5)
+
+        warm_stream = [int(warm.logits.argmax())]
+        state = warm.state
+        for _ in range(3):
+            out = executor.decode(state, warm_stream[-1])
+            state = out.state
+            warm_stream.append(int(out.logits.argmax()))
+        assert warm_stream == cold_stream
+    finally:
+        executor.release("cold")
+        executor.release("warm")
+
+
+def test_hf_prefix_reuse_partial_prefix_matches_cold_prefill():
+    import numpy as np
+
+    executor = _make_executor(enable_prefix_compute_reuse=True)
+    full = executor.encode("The capital of France is Paris and the river is")
+    split = len(full) - 5
+    prefix = full[:split]
+    try:
+        cold = executor.prefill("cold", full)
+        cold_logits = cold.logits.copy()
+        executor.release("cold")
+        _clear_prefix_store(executor)
+
+        # Seed only the prefix snapshot, then prefill the full prompt so the
+        # executor forwards just the uncached tail.
+        executor.prefill("seed", prefix)
+        executor.release("seed")
+        assert executor.prefix_reused_tokens == 0
+
+        warm = executor.prefill("warm", full)
+        assert executor.prefix_reused_tokens == split
+        assert warm.state.num_tokens == len(full)
+        np.testing.assert_allclose(warm.logits, cold_logits, atol=1e-4)
+        assert int(warm.logits.argmax()) == int(cold_logits.argmax())
+    finally:
+        executor.release("cold")
+        executor.release("seed")
+        executor.release("warm")
+
+
+def test_hf_prefix_reuse_covering_prefix_matches_cold_prefill():
+    import numpy as np
+
+    executor = _make_executor(enable_prefix_compute_reuse=True)
+    short_ids = [100, 200, 300, 400]
+    long_ids = short_ids + [500, 600]
+    try:
+        cold = executor.prefill("cold", short_ids)
+        cold_logits = cold.logits.copy()
+        executor.release("cold")
+        _clear_prefix_store(executor)
+
+        # Seed a longer prompt that extends the short one, then prefill the
+        # short prompt: the executor crops the KV and forwards one token.
+        executor.prefill("long", long_ids)
+        executor.release("long")
+        assert executor.prefix_reused_tokens == 0
+
+        warm = executor.prefill("warm", short_ids)
+        assert executor.prefix_reused_tokens == len(short_ids) - 1
+        assert warm.state.num_tokens == len(short_ids)
+        np.testing.assert_allclose(warm.logits, cold_logits, atol=1e-4)
+        assert int(warm.logits.argmax()) == int(cold_logits.argmax())
+    finally:
+        executor.release("cold")
+        executor.release("long")
+        executor.release("warm")

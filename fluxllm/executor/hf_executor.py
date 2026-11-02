@@ -4,24 +4,35 @@ Runs one sequence per forward call. A real per-sequence KV cache is kept via
 transformers' ``DynamicCache`` so prompts are never recomputed during
 decoding.
 
-Scope note (important): decode forwards here are per-sequence, NOT batched
-through a paged attention kernel. Production engines batch the attention
-computation across sequences within a step; FluxLLM batches at the
-scheduling level. This keeps the executor simple, correct, and portable
-across CPU/CUDA, and is documented as a deliberate limitation.
+Scope note (important): decode forwards are per-sequence unless the engine
+batches them (``decode_batch``); even then attention runs through the
+model's own kernel, not a paged attention kernel. FluxLLM's scheduler still
+owns batching decisions, and the executor documents what it does and does
+not batch.
+
+Prefix reuse: completed prefills are snapshotted (cloned KV + next-token
+logits) in a small bounded LRU. A later prompt that shares a cached prefix
+clones that KV and only forwards the remaining tokens — or returns the
+stored logits outright on an exact match. This is executor-level compute
+reuse, distinct from the block manager's capacity-level sharing.
 """
 
 from __future__ import annotations
 
 import logging
+from collections import OrderedDict
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, cast
+
+import numpy as np
 
 from fluxllm.executor.base import SequenceState, StepOutput
 from fluxllm.executor.device import detect_device, resolve_dtype
 
 if TYPE_CHECKING:
     import torch
+
+    from fluxllm.metrics.metrics import EngineMetrics
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +47,10 @@ class HFModelExecutor:
         device: str = "auto",
         trust_remote_code: bool = False,
         max_context_len: int | None = None,
+        enable_prefix_compute_reuse: bool = True,
+        prefix_kv_entries: int = 8,
+        prefix_kv_max_tokens: int = 8192,
+        metrics: EngineMetrics | None = None,
     ) -> None:
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -68,6 +83,18 @@ class HFModelExecutor:
         )
         # request_id -> {"hf_cache": Cache, "num_tokens": int}
         self._caches: dict[str, dict] = {}
+
+        # Executor-level prefix reuse: token-prefix -> (cloned KV, next logits).
+        self._enable_prefix_reuse = enable_prefix_compute_reuse
+        self._prefix_max_entries = max(1, prefix_kv_entries)
+        self._prefix_max_tokens = max(1, prefix_kv_max_tokens)
+        self._prefix_store: OrderedDict[tuple[int, ...], tuple[Any, np.ndarray]] = (
+            OrderedDict()
+        )
+        self._prefix_store_tokens = 0
+        self._metrics = metrics
+        # Cumulative tokens whose KV was reused instead of recomputed.
+        self.prefix_reused_tokens = 0
 
         logger.info(
             "loaded model %s on %s (dtype=%s, vocab=%d, eos=%s, max_context=%d)",
@@ -138,8 +165,154 @@ class HFModelExecutor:
             raise ValueError("prompt exceeds model context length")
         if request_id in self._caches:
             raise RuntimeError(f"sequence {request_id} already prefilled")
-        ids = self.torch.tensor([list(token_ids)], dtype=self.torch.long)
-        return self._forward(request_id, ids, None)
+        try:
+            reused_out, reused_tokens = self._try_prefix_reuse(request_id, token_ids)
+            if reused_out is not None:
+                self._apply_reuse_metrics(reused_tokens)
+                self._remember_prefix(
+                    token_ids, self._caches[request_id]["hf_cache"], reused_out.logits
+                )
+                return reused_out
+            ids = self.torch.tensor([list(token_ids)], dtype=self.torch.long)
+            out = self._forward(request_id, ids, None)
+            self._remember_prefix(token_ids, self._caches[request_id]["hf_cache"], out.logits)
+            return out
+        except Exception:
+            self._caches.pop(request_id, None)
+            raise
+
+    # -- executor-level prefix reuse -----------------------------------------
+    #
+    # A prefill snapshot is the KV for a token prefix plus the logits that
+    # predict the token after it. Reuse cases, all producing the exact logits
+    # a cold prefill would produce:
+    #
+    # * exact match   -> return the stored logits (zero forward work);
+    # * shorter key   -> clone the KV and forward only the remaining tokens;
+    # * covering key  -> the prompt is a prefix of a cached longer prompt;
+    #                    crop the KV to len-1 and forward the last token.
+    #
+    # Snapshots are cloned, never shared: decoding mutates a cache in place.
+
+    def _clone_cache(self, cache: Any, length: int | None = None) -> Any:
+        from transformers import DynamicCache
+
+        clone = DynamicCache()
+        for layer_idx in range(self._num_layers()):
+            layer = cache.layers[layer_idx]
+            if length is None:
+                k = layer.keys.clone()
+                v = layer.values.clone()
+            else:
+                k = layer.keys[:, :, :length, :].clone()
+                v = layer.values[:, :, :length, :].clone()
+            clone.update(k, v, layer_idx)
+        return clone
+
+    def _remember_prefix(
+        self, tokens: Sequence[int], cache: Any, logits: np.ndarray
+    ) -> None:
+        if not self._enable_prefix_reuse:
+            return
+        key = tuple(int(t) for t in tokens)
+        if not key:
+            return
+        if key in self._prefix_store:
+            self._prefix_store_tokens -= len(key)
+            self._prefix_store.pop(key)
+        self._prefix_store[key] = (self._clone_cache(cache), logits.copy())
+        self._prefix_store_tokens += len(key)
+        while (
+            len(self._prefix_store) > self._prefix_max_entries
+            or self._prefix_store_tokens > self._prefix_max_tokens
+        ) and len(self._prefix_store) > 1:
+            old_key, _ = self._prefix_store.popitem(last=False)
+            self._prefix_store_tokens -= len(old_key)
+
+    def _find_reusable_prefix(
+        self, tokens: Sequence[int]
+    ) -> tuple[int, Any, np.ndarray] | None:
+        """Longest cached key that is a prefix of ``tokens``."""
+        seq = tuple(int(t) for t in tokens)
+        best: tuple[int, Any, np.ndarray] | None = None
+        for key, (cache, logits) in self._prefix_store.items():
+            if (
+                len(key) <= len(seq)
+                and seq[: len(key)] == key
+                and (best is None or len(key) > best[0])
+            ):
+                best = (len(key), cache, logits)
+        return best
+
+    def _find_covering_prefix(self, tokens: Sequence[int]) -> tuple[int, Any] | None:
+        """Shortest cached key that extends ``tokens`` (prompt is a prefix)."""
+        seq = tuple(int(t) for t in tokens)
+        best: tuple[int, Any] | None = None
+        for key, (cache, _logits) in self._prefix_store.items():
+            if (
+                len(key) > len(seq)
+                and key[: len(seq)] == seq
+                and (best is None or len(key) < best[0])
+            ):
+                best = (len(key), cache)
+        return best
+
+    def _try_prefix_reuse(
+        self, request_id: str, token_ids: Sequence[int]
+    ) -> tuple[StepOutput | None, int]:
+        """Register ``request_id`` from a cached prefix if possible.
+
+        Returns ``(output, reused_tokens)``; ``(None, 0)`` means a cold
+        prefill is required. The cache entry is registered here so partial
+        reuse can forward the remaining tokens; callers must roll the entry
+        back if their enclosing operation fails.
+        """
+        if not self._enable_prefix_reuse or not self._prefix_store:
+            return None, 0
+        tokens = [int(t) for t in token_ids]
+        try:
+            found = self._find_reusable_prefix(tokens)
+            if found is not None:
+                matched, cache, logits = found
+                cloned = self._clone_cache(cache)
+                entry = {"hf_cache": cloned, "num_tokens": len(tokens)}
+                self._caches[request_id] = entry
+                if matched == len(tokens):
+                    state = SequenceState(
+                        request_id=request_id, num_tokens=len(tokens), kv=entry
+                    )
+                    return (
+                        StepOutput(
+                            logits=logits.copy(),
+                            state=state,
+                            context_exceeded=len(tokens) >= self._max_context_len,
+                        ),
+                        matched,
+                    )
+                rest = self.torch.tensor([tokens[matched:]], dtype=self.torch.long)
+                out = self._forward(request_id, rest, entry)
+                return out, matched
+            covering = self._find_covering_prefix(tokens)
+            if covering is not None and len(tokens) > 1:
+                _, cache = covering
+                cropped = self._clone_cache(cache, length=len(tokens) - 1)
+                entry = {"hf_cache": cropped, "num_tokens": len(tokens) - 1}
+                self._caches[request_id] = entry
+                ids = self.torch.tensor([[tokens[-1]]], dtype=self.torch.long)
+                out = self._forward(request_id, ids, entry)
+                return out, len(tokens) - 1
+            return None, 0
+        except Exception:
+            # A failed reuse must not leave a half-registered sequence.
+            self._caches.pop(request_id, None)
+            raise
+
+    def _apply_reuse_metrics(self, reused_tokens: int) -> None:
+        if reused_tokens <= 0:
+            return
+        self.prefix_reused_tokens += reused_tokens
+        if self._metrics is not None:
+            self._metrics.on_prefix_compute_reuse(reused_tokens)
 
     def decode(self, state: SequenceState, last_token: int) -> StepOutput:
         entry = self._caches.get(state.request_id)
@@ -184,9 +357,12 @@ class HFModelExecutor:
     def prefill_batch(self, prompts: Sequence[tuple[str, Sequence[int]]]) -> list[StepOutput]:
         """Prefill several prompts in one forward (left-padded).
 
-        Callers must have validated the requests are not already prefilled;
-        this method validates all rows before any state is touched, so a
-        failure leaves no partial registrations behind.
+        Rows whose prompt shares a cached prefix are served from that KV
+        (no forward, or only the uncached tail); the remaining rows share
+        one left-padded forward. Callers must have validated the requests
+        are not already prefilled; this method validates all rows before any
+        state is touched and rolls back every registration if any step
+        fails, so a failure leaves no partial state behind.
         """
         torch = self.torch
         if not prompts:
@@ -198,48 +374,82 @@ class HFModelExecutor:
                 raise ValueError("prompt exceeds model context length")
             if request_id in self._caches:
                 raise RuntimeError(f"sequence {request_id} already prefilled")
-        bsz = len(prompts)
-        lengths = [len(tokens) for _, tokens in prompts]
-        max_prompt = max(lengths)
-        pad_id = int(
-            getattr(self.tokenizer, "pad_token_id", None)
-            or getattr(self.tokenizer, "eos_token_id", None)
-            or 0
-        )
-        ids = torch.full((bsz, max_prompt), pad_id, dtype=torch.long)
-        attention = torch.zeros((bsz, max_prompt), dtype=torch.long)
-        position_ids = torch.zeros((bsz, max_prompt), dtype=torch.long)
-        for row, (_, tokens) in enumerate(prompts):
-            n = len(tokens)
-            ids[row, max_prompt - n :] = torch.tensor(list(tokens), dtype=torch.long)
-            attention[row, max_prompt - n :] = 1
-            position_ids[row, max_prompt - n :] = torch.arange(n)
-        with torch.inference_mode():
-            outputs = self.model(
-                input_ids=ids.to(self.device),
-                attention_mask=attention.to(self.device),
-                position_ids=position_ids.to(self.device),
-                past_key_values=None,
-                use_cache=True,
-            )
-        past = outputs.past_key_values
-        results: list[StepOutput] = []
-        for row, (request_id, _tokens) in enumerate(prompts):
-            n = lengths[row]
-            entry = {
-                "hf_cache": self._row_cache(past, row, max_prompt - n, n),
-                "num_tokens": n,
-            }
-            self._caches[request_id] = entry
-            state = SequenceState(request_id=request_id, num_tokens=n, kv=entry)
-            results.append(
-                StepOutput(
-                    logits=outputs.logits[row, -1, :].float().detach().cpu().numpy(),
-                    state=state,
-                    context_exceeded=n >= self._max_context_len,
+
+        results: list[StepOutput | None] = [None] * len(prompts)
+        cold: list[int] = []
+        reused: list[tuple[int, int]] = []  # (row index, reused tokens)
+        registered: list[str] = []
+        try:
+            for row, (request_id, tokens) in enumerate(prompts):
+                out, reused_tokens = self._try_prefix_reuse(request_id, tokens)
+                if out is None:
+                    cold.append(row)
+                    continue
+                results[row] = out
+                registered.append(request_id)
+                if reused_tokens:
+                    reused.append((row, reused_tokens))
+                self._remember_prefix(
+                    tokens, self._caches[request_id]["hf_cache"], out.logits
                 )
-            )
-        return results
+            if cold:
+                cold_prompts = [prompts[i] for i in cold]
+                bsz = len(cold_prompts)
+                lengths = [len(tokens) for _, tokens in cold_prompts]
+                max_prompt = max(lengths)
+                pad_id = int(
+                    getattr(self.tokenizer, "pad_token_id", None)
+                    or getattr(self.tokenizer, "eos_token_id", None)
+                    or 0
+                )
+                ids = torch.full((bsz, max_prompt), pad_id, dtype=torch.long)
+                attention = torch.zeros((bsz, max_prompt), dtype=torch.long)
+                position_ids = torch.zeros((bsz, max_prompt), dtype=torch.long)
+                for batch_row, (_, tokens) in enumerate(cold_prompts):
+                    n = len(tokens)
+                    ids[batch_row, max_prompt - n :] = torch.tensor(
+                        list(tokens), dtype=torch.long
+                    )
+                    attention[batch_row, max_prompt - n :] = 1
+                    position_ids[batch_row, max_prompt - n :] = torch.arange(n)
+                with torch.inference_mode():
+                    outputs = self.model(
+                        input_ids=ids.to(self.device),
+                        attention_mask=attention.to(self.device),
+                        position_ids=position_ids.to(self.device),
+                        past_key_values=None,
+                        use_cache=True,
+                    )
+                past = outputs.past_key_values
+                for batch_row, row in enumerate(cold):
+                    request_id, tokens = cold_prompts[batch_row]
+                    n = lengths[batch_row]
+                    entry = {
+                        "hf_cache": self._row_cache(past, batch_row, max_prompt - n, n),
+                        "num_tokens": n,
+                    }
+                    self._caches[request_id] = entry
+                    registered.append(request_id)
+                    state = SequenceState(request_id=request_id, num_tokens=n, kv=entry)
+                    out = StepOutput(
+                        logits=outputs.logits[batch_row, -1, :]
+                        .float()
+                        .detach()
+                        .cpu()
+                        .numpy(),
+                        state=state,
+                        context_exceeded=n >= self._max_context_len,
+                    )
+                    results[row] = out
+                    self._remember_prefix(tokens, entry["hf_cache"], out.logits)
+        except Exception:
+            for request_id in registered:
+                self._caches.pop(request_id, None)
+            raise
+
+        for _row, reused_tokens in reused:
+            self._apply_reuse_metrics(reused_tokens)
+        return cast("list[StepOutput]", results)
 
     def decode_batch(self, batch: Sequence[tuple[SequenceState, int]]) -> list[StepOutput]:
         """Decode one token for several sequences in a single forward.

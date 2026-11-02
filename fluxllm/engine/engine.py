@@ -643,6 +643,10 @@ def _make_executor(settings: EngineSettings) -> ModelExecutor:
         return DeterministicExecutor(
             vocab_size=settings.vocab_size,
             eos_token_id=getattr(settings, "demo_eos_token_id", None),
+            enable_prefix_compute_reuse=settings.enable_prefix_compute_reuse,
+            prefix_kv_entries=settings.prefix_kv_cache_entries,
+            prefix_kv_max_tokens=settings.prefix_kv_cache_max_tokens,
+            metrics=global_metrics,
         )
     from fluxllm.executor.hf_executor import HFModelExecutor
 
@@ -651,6 +655,10 @@ def _make_executor(settings: EngineSettings) -> ModelExecutor:
         dtype=settings.dtype,
         device=settings.device,
         trust_remote_code=settings.trust_remote_code,
+        enable_prefix_compute_reuse=settings.enable_prefix_compute_reuse,
+        prefix_kv_entries=settings.prefix_kv_cache_entries,
+        prefix_kv_max_tokens=settings.prefix_kv_cache_max_tokens,
+        metrics=global_metrics,
     )
 
 

@@ -122,3 +122,6 @@ def test_metrics_endpoint_exposes_prometheus(client):
     assert "fluxllm_requests_received_total" in text
     assert "fluxllm_generated_tokens_total" in text
     assert "fluxllm_kv_cache_utilization_ratio" in text
+    assert "fluxllm_batched_model_forwards" in text
+    assert "fluxllm_prefix_compute_reuses_total" in text
+    assert "fluxllm_prefix_compute_reused_tokens_total" in text

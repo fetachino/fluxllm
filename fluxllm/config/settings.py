@@ -34,6 +34,11 @@ class EngineSettings(BaseSettings):
     max_queue_size: int = 128
     scheduler_policy: Literal["fifo", "longest_queue_first"] = "fifo"
     enable_batched_execution: bool = True  # one forward per phase across sequences
+    # Executor-level prefix reuse: reuse KV for shared prompt prefixes instead
+    # of recomputing them (the block cache shares capacity, this skips compute).
+    enable_prefix_compute_reuse: bool = True
+    prefix_kv_cache_entries: int = 8
+    prefix_kv_cache_max_tokens: int = 8192
 
     # KV cache --------------------------------------------------------------
     block_size: int = 16  # tokens per logical block

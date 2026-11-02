@@ -13,11 +13,16 @@ both identically.
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from collections.abc import Sequence
+from typing import TYPE_CHECKING
 
 import numpy as np
 
 from fluxllm.executor.base import SequenceState, StepOutput
+
+if TYPE_CHECKING:
+    from fluxllm.metrics.metrics import EngineMetrics
 
 
 class DeterministicExecutor:
@@ -30,6 +35,10 @@ class DeterministicExecutor:
         step: int = 7,
         offset: int = 3,
         max_context_len: int = 8192,
+        enable_prefix_compute_reuse: bool = True,
+        prefix_kv_entries: int = 8,
+        prefix_kv_max_tokens: int = 8192,
+        metrics: EngineMetrics | None = None,
     ) -> None:
         self._vocab_size = vocab_size
         self._eos_token_id = eos_token_id
@@ -40,6 +49,15 @@ class DeterministicExecutor:
         # Uniform low logit for non-target entries so sampling policy paths
         # (temperature/top-k/top-p) see a non-degenerate distribution.
         self._noise_logit = -16.0
+        # Prefix-reuse twin: same bounded LRU shape as the HF executor, but
+        # the "KV snapshot" is just the logits (the fake state is length-only).
+        self._enable_prefix_reuse = enable_prefix_compute_reuse
+        self._prefix_max_entries = max(1, prefix_kv_entries)
+        self._prefix_max_tokens = max(1, prefix_kv_max_tokens)
+        self._prefix_store: OrderedDict[tuple[int, ...], np.ndarray] = OrderedDict()
+        self._prefix_store_tokens = 0
+        self._metrics = metrics
+        self.prefix_reused_tokens = 0
 
     # -- properties ---------------------------------------------------------
     @property
@@ -58,6 +76,9 @@ class DeterministicExecutor:
     def reset(self) -> None:
         """Drop all sequence state (used between tests/simulations)."""
         self._states.clear()
+        self._prefix_store.clear()
+        self._prefix_store_tokens = 0
+        self.prefix_reused_tokens = 0
 
     def release(self, request_id: str) -> None:
         self._states.pop(request_id, None)
@@ -81,9 +102,83 @@ class DeterministicExecutor:
             raise ValueError("prefill requires at least one token")
         if request_id in self._states:
             raise RuntimeError(f"sequence {request_id} already prefilled")
+        out, reused_tokens = self._try_prefix_reuse(request_id, token_ids)
+        if out is not None:
+            self._apply_reuse_metrics(reused_tokens)
+            self._remember_prefix(token_ids, out.logits)
+            return out
         state = SequenceState(request_id=request_id, num_tokens=len(token_ids))
         self._states[request_id] = state
-        return self._build_logits(state)
+        out = self._build_logits(state)
+        self._remember_prefix(token_ids, out.logits)
+        return out
+
+    # -- prefix reuse twin ---------------------------------------------------
+    def _remember_prefix(self, tokens: Sequence[int], logits: np.ndarray) -> None:
+        if not self._enable_prefix_reuse:
+            return
+        key = tuple(int(t) for t in tokens)
+        if not key:
+            return
+        if key in self._prefix_store:
+            self._prefix_store_tokens -= len(key)
+            self._prefix_store.pop(key)
+        self._prefix_store[key] = logits.copy()
+        self._prefix_store_tokens += len(key)
+        while (
+            len(self._prefix_store) > self._prefix_max_entries
+            or self._prefix_store_tokens > self._prefix_max_tokens
+        ) and len(self._prefix_store) > 1:
+            old_key, _ = self._prefix_store.popitem(last=False)
+            self._prefix_store_tokens -= len(old_key)
+
+    def _find_reusable_prefix(self, tokens: Sequence[int]) -> int | None:
+        seq = tuple(int(t) for t in tokens)
+        best: int | None = None
+        for key in self._prefix_store:
+            if (
+                len(key) <= len(seq)
+                and seq[: len(key)] == key
+                and (best is None or len(key) > best)
+            ):
+                best = len(key)
+        return best
+
+    def _find_covering_prefix(self, tokens: Sequence[int]) -> int | None:
+        seq = tuple(int(t) for t in tokens)
+        best: int | None = None
+        for key in self._prefix_store:
+            if (
+                len(key) > len(seq)
+                and key[: len(seq)] == seq
+                and (best is None or len(key) < best)
+            ):
+                best = len(key)
+        return best
+
+    def _try_prefix_reuse(
+        self, request_id: str, token_ids: Sequence[int]
+    ) -> tuple[StepOutput | None, int]:
+        if not self._enable_prefix_reuse or not self._prefix_store:
+            return None, 0
+        matched = self._find_reusable_prefix(token_ids)
+        if matched is not None:
+            state = SequenceState(request_id=request_id, num_tokens=len(token_ids))
+            self._states[request_id] = state
+            return self._build_logits(state), matched
+        covering = self._find_covering_prefix(token_ids)
+        if covering is not None and len(token_ids) > 1:
+            state = SequenceState(request_id=request_id, num_tokens=len(token_ids))
+            self._states[request_id] = state
+            return self._build_logits(state), len(token_ids) - 1
+        return None, 0
+
+    def _apply_reuse_metrics(self, reused_tokens: int) -> None:
+        if reused_tokens <= 0:
+            return
+        self.prefix_reused_tokens += reused_tokens
+        if self._metrics is not None:
+            self._metrics.on_prefix_compute_reuse(reused_tokens)
 
     def decode(self, state: SequenceState, last_token: int) -> StepOutput:
         cached = self._states.get(state.request_id)
@@ -106,10 +201,19 @@ class DeterministicExecutor:
             if request_id in self._states:
                 raise RuntimeError(f"sequence {request_id} already prefilled")
         outs: list[StepOutput] = []
+        reused: list[int] = []
         for request_id, tokens in prompts:
-            state = SequenceState(request_id=request_id, num_tokens=len(tokens))
-            self._states[request_id] = state
-            outs.append(self._build_logits(state))
+            out, reused_tokens = self._try_prefix_reuse(request_id, tokens)
+            if out is None:
+                state = SequenceState(request_id=request_id, num_tokens=len(tokens))
+                self._states[request_id] = state
+                out = self._build_logits(state)
+            else:
+                reused.append(reused_tokens)
+            self._remember_prefix(tokens, out.logits)
+            outs.append(out)
+        for reused_tokens in reused:
+            self._apply_reuse_metrics(reused_tokens)
         return outs
 
     def decode_batch(self, batch: Sequence[tuple[SequenceState, int]]) -> list[StepOutput]:

@@ -25,12 +25,11 @@ import asyncio
 import csv
 import os
 import platform
-import statistics
 import subprocess
 import sys
 import time
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 MODEL_NAME = "Qwen/Qwen2.5-0.5B-Instruct"
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -71,6 +70,7 @@ class RunResult:
     total_tokens: int
     throughput_tokens_per_s: float
     arrivals: int
+    batched_execution: bool | None = None
     preemptions: int | None = None
     ttft_p50_seconds: float | None = None
     ttft_p95_seconds: float | None = None
@@ -92,7 +92,7 @@ def env_snapshot() -> dict:
     import transformers
 
     return {
-        "date_utc": datetime.now(timezone.utc).isoformat(),
+        "date_utc": datetime.now(UTC).isoformat(),
         "python": platform.python_version(),
         "platform": platform.platform(),
         "machine": platform.machine(),
@@ -179,10 +179,10 @@ def run_fluxllm(
     max_new_tokens: int,
     concurrency: int,
     warmup: int = 0,
+    batched: bool = True,
 ) -> RunResult:
     from fluxllm.config.settings import EngineSettings
     from fluxllm.engine.engine import FluxEngine
-    from fluxllm.executor.hf_executor import HFModelExecutor
     from fluxllm.sampling.config import SamplingParams
 
     settings = EngineSettings(
@@ -190,6 +190,10 @@ def run_fluxllm(
         dtype="float32",
         device="cpu",
         enable_prefix_cache=True,
+        enable_batched_execution=batched,
+        # Keep the batched-vs-sequential comparison about execution, not
+        # about prompt reuse: every run cold-prefills the same prompt set.
+        enable_prefix_compute_reuse=False,
         block_size=16,
         num_blocks=96,
         max_batch_size=concurrency,
@@ -199,10 +203,7 @@ def run_fluxllm(
         max_new_tokens=max_new_tokens,
         seed=42,
     )
-    executor = HFModelExecutor(
-        model_name=MODEL_NAME, dtype="float32", device="cpu"
-    )
-    engine = FluxEngine.from_settings(settings, executor=executor)
+    engine = FluxEngine.from_settings(settings)
 
     async def one(prompt: str) -> RequestResult:
         handle = engine.submit(
@@ -253,6 +254,7 @@ def run_fluxllm(
     result = RunResult(
         mode="fluxllm",
         concurrency=concurrency,
+        batched_execution=batched,
         wall_seconds=wall,
         total_tokens=tokens_total,
         throughput_tokens_per_s=tokens_total / wall,
@@ -271,6 +273,7 @@ def write_csv(runs: list[RunResult], path: str) -> None:
     headers = [
         "mode",
         "concurrency",
+        "batched_execution",
         "wall_seconds",
         "total_tokens",
         "throughput_tokens_per_s",
@@ -306,6 +309,17 @@ def main() -> int:
         help="skip the sequential baseline run",
     )
     parser.add_argument(
+        "--no-batched-decode",
+        dest="batched",
+        action="store_false",
+        help="run the engine with per-sequence decode forwards (pre-batched path)",
+    )
+    parser.add_argument(
+        "--compare-batched",
+        action="store_true",
+        help="measure batched and per-sequence decode at every concurrency level",
+    )
+    parser.add_argument(
         "--quick",
         action="store_true",
         help="tiny wiring-validation run (2 prompts, 4 tokens)",
@@ -334,23 +348,38 @@ def main() -> int:
               f"({last.throughput_tokens_per_s:.2f} tok/s)")
 
     for level in args.concurrency:
-        print(f"running FluxLLM concurrency={level} ...")
-        runs.append(
-            run_fluxllm(prompts, max_new_tokens, level, warmup=args.warmup)
-        )
-        last = runs[-1]
-        preemptions = last.preemptions
-        print(
-            f"  -> {last.total_tokens} tokens in {last.wall_seconds:.1f}s "
-            f"({last.throughput_tokens_per_s:.2f} tok/s, "
-            f"ttft_p50={last.ttft_p50_seconds:.2f}s, preemptions={preemptions})"
-        )
+        variants = [True, False] if args.compare_batched else [args.batched]
+        for batched in variants:
+            label = "batched" if batched else "per-sequence"
+            print(f"running FluxLLM concurrency={level} ({label} decode) ...")
+            runs.append(
+                run_fluxllm(
+                    prompts, max_new_tokens, level, warmup=args.warmup, batched=batched
+                )
+            )
+            last = runs[-1]
+            preemptions = last.preemptions
+            print(
+                f"  -> {last.total_tokens} tokens in {last.wall_seconds:.1f}s "
+                f"({last.throughput_tokens_per_s:.2f} tok/s, "
+                f"ttft_p50={last.ttft_p50_seconds:.2f}s, preemptions={preemptions})"
+            )
 
     os.makedirs(RESULTS_DIR, exist_ok=True)
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     json_path = os.path.join(RESULTS_DIR, f"run_{stamp}.json")
     csv_path = os.path.join(RESULTS_DIR, f"summary_{stamp}.csv")
-    payload = {"env": env_snapshot(), "runs": [asdict(run) for run in runs]}
+    payload = {
+        "env": env_snapshot(),
+        "settings": {
+            "batched_execution": args.batched,
+            "compare_batched": args.compare_batched,
+            "concurrency": args.concurrency,
+            "max_new_tokens": max_new_tokens,
+            "warmup": args.warmup,
+        },
+        "runs": [asdict(run) for run in runs],
+    }
     with open(json_path, "w", encoding="utf-8") as handle:
         import json
 
