@@ -27,6 +27,7 @@ from fluxllm.api.schemas import (
     HealthInfo,
     Usage,
 )
+from fluxllm.engine.detokenizer import IncrementalDetokenizer
 from fluxllm.engine.engine import EngineFullError, RequestHandle
 from fluxllm.engine.lifecycle import RequestState
 from fluxllm.sampling.config import SamplingParams
@@ -156,8 +157,7 @@ async def _stream_completion_sse(
     """Yield OpenAI-style SSE chunks for /v1/completions."""
     created = int(time.time())
     completion_id = f"cmpl-{handle.request.request_id[:24]}"
-    previous = ""
-    streamed_ids: list[int] = []
+    detokenizer = IncrementalDetokenizer(app.state.detokenize)
     try:
         async for event in handle.stream():
             if event.type == "token":
@@ -165,11 +165,7 @@ async def _stream_completion_sse(
                 # shared generated_token_ids can race ahead of event
                 # consumption (the engine keeps sampling), which would fuse
                 # or drop streamed pieces.
-                if event.token_id is not None:
-                    streamed_ids.append(event.token_id)
-                full = app.state.detokenize(streamed_ids)
-                piece = full[len(previous) :] if full.startswith(previous) else full
-                previous = full
+                piece = detokenizer.update(event.token_id) if event.token_id is not None else ""
                 if piece:
                     yield _sse(
                         {
@@ -181,6 +177,19 @@ async def _stream_completion_sse(
                         }
                     )
             elif event.type == "status":
+                tail = detokenizer.finalize()
+                if tail:
+                    yield _sse(
+                        {
+                            "id": completion_id,
+                            "object": "text_completion.chunk",
+                            "created": created,
+                            "model": "fluxllm",
+                            "choices": [
+                                {"index": 0, "text": tail, "finish_reason": None}
+                            ],
+                        }
+                    )
                 yield _sse(
                     {
                         "id": completion_id,
@@ -196,6 +205,17 @@ async def _stream_completion_sse(
                         ],
                     }
                 )
+        tail = detokenizer.finalize()
+        if tail:
+            yield _sse(
+                {
+                    "id": completion_id,
+                    "object": "text_completion.chunk",
+                    "created": created,
+                    "model": "fluxllm",
+                    "choices": [{"index": 0, "text": tail, "finish_reason": None}],
+                }
+            )
         yield "data: [DONE]\n\n"
     except asyncio.CancelledError:
         handle.cancel()
@@ -211,18 +231,13 @@ def _map_reason(reason: str | None) -> str | None:
 async def _stream_chat_sse(app: FastAPI, handle: RequestHandle) -> AsyncIterator[str]:
     created = int(time.time())
     completion_id = f"chatcmpl-{handle.request.request_id[:24]}"
-    previous = ""
-    streamed_ids: list[int] = []
+    detokenizer = IncrementalDetokenizer(app.state.detokenize)
     try:
         async for event in handle.stream():
             if event.type == "token":
                 # Same race-avoidance as the completion stream: accumulate
                 # ids per consumed event instead of reading shared state.
-                if event.token_id is not None:
-                    streamed_ids.append(event.token_id)
-                full = app.state.detokenize(streamed_ids)
-                piece = full[len(previous) :] if full.startswith(previous) else full
-                previous = full
+                piece = detokenizer.update(event.token_id) if event.token_id is not None else ""
                 if piece:
                     yield _sse(
                         {
@@ -240,6 +255,23 @@ async def _stream_chat_sse(app: FastAPI, handle: RequestHandle) -> AsyncIterator
                         }
                     )
             elif event.type == "status":
+                tail = detokenizer.finalize()
+                if tail:
+                    yield _sse(
+                        {
+                            "id": completion_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": "fluxllm",
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {"content": tail},
+                                    "finish_reason": None,
+                                }
+                            ],
+                        }
+                    )
                 yield _sse(
                     {
                         "id": completion_id,
@@ -255,6 +287,23 @@ async def _stream_chat_sse(app: FastAPI, handle: RequestHandle) -> AsyncIterator
                         ],
                     }
                 )
+        tail = detokenizer.finalize()
+        if tail:
+            yield _sse(
+                {
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": "fluxllm",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"content": tail},
+                            "finish_reason": None,
+                        }
+                    ],
+                }
+            )
         yield "data: [DONE]\n\n"
     except asyncio.CancelledError:
         handle.cancel()
