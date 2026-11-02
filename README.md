@@ -164,9 +164,6 @@ tests/integration/  real-model tests (env-gated)
 - [SECURITY.md](SECURITY.md) — threat model and hardening.
 - [CHANGELOG.md](CHANGELOG.md) — release history; every entry maps to real commits and committed artifacts.
 - [docs/deployment.md](docs/deployment.md) — Docker, Compose, Coolify.
-- [docs/interview-guide.md](docs/interview-guide.md) — deep-dive talking
-  points on every subsystem.
-- [docs/resume-notes.md](docs/resume-notes.md) — resume blurb variants.
 
 ## License
 
