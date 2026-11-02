@@ -23,6 +23,7 @@ def engine_factory():
         max_new_tokens: int = 64,
         vocab_size: int = 32,
         eos_token_id: int | None = None,
+        enable_batched_execution: bool = True,
     ) -> FluxEngine:
         settings = EngineSettings(
             deterministic=True,
@@ -34,6 +35,7 @@ def engine_factory():
             max_queue_size=max_queue_size,
             max_prompt_tokens=max_prompt_tokens,
             max_new_tokens=max_new_tokens,
+            enable_batched_execution=enable_batched_execution,
         )
         engine = FluxEngine.from_settings(
             settings,

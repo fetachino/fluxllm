@@ -25,14 +25,14 @@ import logging
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import numpy as np
 
 from fluxllm.cache.block_manager import BlockManager
 from fluxllm.engine.lifecycle import RequestState
 from fluxllm.engine.request import CompletionReason, GenerationRequest
-from fluxllm.executor.base import ModelExecutor, SequenceState
+from fluxllm.executor.base import ModelExecutor, SequenceState, StepOutput
 from fluxllm.metrics.metrics import EngineMetrics, global_metrics
 from fluxllm.sampling.config import SamplingParams
 from fluxllm.sampling.sampler import Sampler
@@ -100,6 +100,16 @@ class _SeqRuntime:
     last_token_at: float | None = None
 
 
+@dataclass
+class _FeedRow:
+    """A sequence whose sampled token is ready to be fed to the executor."""
+
+    request: GenerationRequest
+    runtime: _SeqRuntime
+    state: SequenceState
+    token_id: int
+
+
 class FluxEngine:
     """Async engine tying together scheduler, block manager, and executor."""
 
@@ -115,6 +125,7 @@ class FluxEngine:
         max_new_tokens_limit: int | None = None,
         default_seed: int | None = 42,
         metrics: EngineMetrics | None = None,
+        enable_batched_execution: bool = True,
     ) -> None:
         self.executor = executor
         self._tokenize = tokenize
@@ -124,6 +135,7 @@ class FluxEngine:
         self.max_prompt_tokens = max_prompt_tokens
         self.max_new_tokens_limit = max_new_tokens_limit
         self.default_seed = default_seed
+        self.enable_batched_execution = enable_batched_execution
         self.sampler = Sampler()
 
         self.scheduler = Scheduler(
@@ -167,6 +179,7 @@ class FluxEngine:
             max_prompt_tokens=settings.max_prompt_tokens,
             max_new_tokens_limit=settings.max_new_tokens,
             default_seed=settings.seed,
+            enable_batched_execution=settings.enable_batched_execution,
             metrics=global_metrics,
         )
 
@@ -293,17 +306,144 @@ class FluxEngine:
 
     async def _run_iteration(self) -> bool:
         plan = self.scheduler.plan()
-        for request in plan.prefills:
-            await self._prefill_step(request)
+        # Rows whose sampled token is ready to feed to the executor: from
+        # prefills (first sampled token) and from decodes (each next token).
+        # With batched execution they share ONE forward per iteration.
+        feed_rows: list[_FeedRow] = []
+        await self._run_prefills(plan.prefills, feed_rows)
         for request in plan.decodes:
             runtime = self._runtime.get(request.request_id)
             if runtime is None or runtime.pending_logits is None:
+                continue  # nothing sampled yet (e.g. right after admission)
+            if self._check_cancel(request, runtime):
                 continue
-            await self._decode_step(request)
+            if request.num_generated_tokens >= request.sampling.max_new_tokens:
+                self._finish_request(request, CompletionReason.LENGTH, runtime.queue)
+                continue
+            row = self._sample_for_feed(request, runtime, runtime.pending_logits)
+            if row is not None:
+                feed_rows.append(row)
+        if feed_rows:
+            await self._execute_feed_rows(feed_rows)
         # Telemetry after committed work: plan() already admitted sequences,
         # so a metrics failure must never strand their prefills.
         self.metrics.on_iteration(self.scheduler.batch_size(), self.block_manager)
-        return bool(plan.prefills) or bool(plan.decodes)
+        return bool(plan.prefills) or bool(feed_rows)
+
+    # -- batched step execution ----------------------------------------------
+    async def _run_prefills(
+        self, requests: list[GenerationRequest], feed_rows: list[_FeedRow]
+    ) -> None:
+        """Prefill planned requests; rows feed forward into this iteration."""
+        if not requests:
+            return
+        ready: list[tuple[GenerationRequest, _SeqRuntime]] = []
+        for request in requests:
+            runtime = self._runtime.get(request.request_id)
+            if runtime is None or self._check_cancel(request, runtime):
+                continue
+            ready.append((request, runtime))
+        if not ready:
+            return
+        prefill_batch = getattr(self.executor, "prefill_batch", None)
+        outs: list | None = None
+        if self.enable_batched_execution and len(ready) > 1 and callable(prefill_batch):
+            prompts = [
+                (request.request_id, request.prompt_token_ids + request.generated_token_ids)
+                for request, _ in ready
+            ]
+            try:
+                outs = await asyncio.to_thread(prefill_batch, prompts)
+            except Exception:  # noqa: BLE001 - fall back to per-sequence
+                logger.exception("batched prefill failed; falling back per sequence")
+                outs = None
+        if outs is not None:
+            for (request, runtime), out in zip(ready, outs, strict=True):
+                self._commit_prefill(request, runtime, out, feed_rows)
+        else:
+            for request, _runtime in ready:
+                await self._prefill_step(request)
+
+    def _commit_prefill(
+        self,
+        request: GenerationRequest,
+        runtime: _SeqRuntime,
+        out: object,
+        feed_rows: list[_FeedRow],
+    ) -> None:
+        self.scheduler.record_prefill(request, cast("StepOutput", out).state)
+        request.transition(RequestState.DECODING)
+        runtime.state = cast("StepOutput", out).state
+        row = self._sample_for_feed(request, runtime, cast("StepOutput", out).logits)
+        if row is not None:
+            feed_rows.append(row)
+
+    def _sample_for_feed(
+        self, request: GenerationRequest, runtime: _SeqRuntime, logits: np.ndarray
+    ) -> _FeedRow | None:
+        """Sample the next token, stream it, reserve KV; prepare the feed.
+
+        Mirrors the commitment order of the sequential path: terminal tokens
+        finish the request without a forward, and failed KV reservations
+        preempt exactly the same way. Streaming and TTFT/inter-token
+        decoration happen here, before the executor call, like the
+        sequential path.
+        """
+        token_id = int(self.sampler.sample(logits, request.sampling, runtime.rng))
+        if self._terminal_token(request, token_id):
+            reason = (
+                CompletionReason.STOP_TOKEN
+                if self._is_stop_token(token_id, request)
+                else CompletionReason.EOS
+            )
+            request.append_token(token_id)
+            self._record_token(request, runtime)
+            self._push_token(runtime, token_id)
+            self._finish_request(request, reason, runtime.queue)
+            return None
+        if not self.scheduler.advance(request):
+            self._preempt(request)
+            return None
+        request.append_token(token_id)
+        self._record_token(request, runtime)
+        self._push_token(runtime, token_id)
+        if runtime.state is None:
+            # Should be unreachable: prefill always produced executor state.
+            self._fail_request(request, RuntimeError("executor state missing before decode"))
+            return None
+        return _FeedRow(
+            request=request,
+            runtime=runtime,
+            state=runtime.state,
+            token_id=token_id,
+        )
+
+    async def _execute_feed_rows(self, rows: list[_FeedRow]) -> None:
+        decode_batch = getattr(self.executor, "decode_batch", None)
+        if self.enable_batched_execution and len(rows) > 1 and callable(decode_batch):
+            try:
+                outs = await asyncio.to_thread(
+                    decode_batch, [(row.state, row.token_id) for row in rows]
+                )
+            except Exception:  # noqa: BLE001 - batch forward failed before write-back
+                logger.exception("batched decode failed; falling back per sequence")
+            else:
+                for row, out in zip(rows, outs, strict=True):
+                    self._commit_decode(row, out)
+                self.metrics.on_batched_forward(len(rows))
+                return
+        for row in rows:
+            try:
+                out = await asyncio.to_thread(self.executor.decode, row.state, row.token_id)
+            except Exception as exc:  # noqa: BLE001
+                self._fail_request(row.request, exc)
+                continue
+            self._commit_decode(row, out)
+
+    def _commit_decode(self, row: _FeedRow, out: object) -> None:
+        step = cast("StepOutput", out)
+        row.runtime.pending_logits = step.logits
+        row.runtime.state = step.state
 
     # -- step execution ------------------------------------------------------
     async def _prefill_step(self, request: GenerationRequest) -> None:
@@ -320,17 +460,6 @@ class FluxEngine:
         request.transition(RequestState.DECODING)
         runtime.state = out.state
         await self._sample_and_stream(request, out.logits)
-
-    async def _decode_step(self, request: GenerationRequest) -> None:
-        runtime = self._runtime[request.request_id]
-        if self._check_cancel(request, runtime):
-            return
-        if request.num_generated_tokens >= request.sampling.max_new_tokens:
-            self._finish_request(request, CompletionReason.LENGTH, runtime.queue)
-            return
-        if runtime.pending_logits is None:
-            return  # nothing sampled yet (e.g. right after admission)
-        await self._sample_and_stream(request, runtime.pending_logits)
 
     async def _sample_and_stream(self, request: GenerationRequest, logits: np.ndarray) -> None:
         """Sample the next token, stream it, and feed it back to the executor."""

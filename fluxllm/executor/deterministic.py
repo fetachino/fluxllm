@@ -94,3 +94,37 @@ class DeterministicExecutor:
         cached.num_tokens += 1
         state.num_tokens = cached.num_tokens
         return self._build_logits(cached)
+
+    # -- batched execution (same logits pattern as the sequential path) ------
+    def prefill_batch(self, prompts: Sequence[tuple[str, Sequence[int]]]) -> list[StepOutput]:
+        """Prefill several prompts; validates every row before any state."""
+        if not prompts:
+            return []
+        for request_id, tokens in prompts:
+            if not tokens:
+                raise ValueError("prefill requires at least one token")
+            if request_id in self._states:
+                raise RuntimeError(f"sequence {request_id} already prefilled")
+        outs: list[StepOutput] = []
+        for request_id, tokens in prompts:
+            state = SequenceState(request_id=request_id, num_tokens=len(tokens))
+            self._states[request_id] = state
+            outs.append(self._build_logits(state))
+        return outs
+
+    def decode_batch(self, batch: Sequence[tuple[SequenceState, int]]) -> list[StepOutput]:
+        """Advance several sequences one token; identical results to sequential."""
+        if not batch:
+            return []
+        entries: list[tuple[SequenceState, SequenceState]] = []
+        for state, _last_token in batch:
+            cached = self._states.get(state.request_id)
+            if cached is None or cached.num_tokens != state.num_tokens:
+                raise RuntimeError(f"decode for unknown/stale sequence {state.request_id}")
+            entries.append((cached, state))
+        outs: list[StepOutput] = []
+        for cached, state in entries:
+            cached.num_tokens += 1
+            state.num_tokens = cached.num_tokens
+            outs.append(self._build_logits(cached))
+        return outs

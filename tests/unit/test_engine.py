@@ -199,3 +199,54 @@ async def test_back_to_back_engines_stream_normally(engine_factory):
         assert len(events) == 4
         assert handle.request.state is RequestState.COMPLETED
         await engine.aclose()
+
+
+async def test_batched_execution_matches_sequential(engine_factory):
+    """Batched and sequential execution must produce identical token streams.
+
+    The engine default is batched execution (one model forward per phase
+    across all decoding sequences). Every stream must be byte-for-byte the
+    same as running with the batch disabled, since executor scheduling must
+    not change generation semantics.
+    """
+    prompts = ["subtensor of cadence", "regency of winrock", "smaller patron index"]
+
+    async def run(batched: bool) -> list[list[int]]:
+        engine = engine_factory(
+            num_blocks=16,
+            block_size=4,
+            max_batch_size=4,
+            max_new_tokens=6,
+            enable_batched_execution=batched,
+        )
+        engine.start()
+        handles = [engine.submit(p, SamplingParams(max_new_tokens=6, seed=7)) for p in prompts]
+        streams = [await asyncio.wait_for(tokens_of(h), timeout=10) for h in handles]
+        for h in handles:
+            assert h.request.state is RequestState.COMPLETED, h.request.error
+        await engine.aclose()
+        return streams
+
+    batched_stream = await run(True)
+    sequential_stream = await run(False)
+    assert batched_stream == sequential_stream
+    assert all(len(s) == 6 for s in batched_stream)
+
+
+async def test_batched_forward_metric_records_grouped_forwards(engine_factory):
+    """The batched-forward counter proves the engine really grouped work."""
+    from fluxllm.metrics.metrics import global_metrics
+
+    before = global_metrics.batched_forwards._value.get()
+    engine = engine_factory(num_blocks=16, block_size=4, max_batch_size=4, max_new_tokens=4)
+    engine.start()
+    handles = [
+        engine.submit(f"prompt {i} for batching", SamplingParams(max_new_tokens=4, seed=1))
+        for i in range(3)
+    ]
+    for h in handles:
+        _ = [e async for e in h.stream()]
+        assert h.request.state is RequestState.COMPLETED
+    await engine.aclose()
+    after = global_metrics.batched_forwards._value.get()
+    assert after > before, "batched forwards counter did not move during a multi-sequence run"

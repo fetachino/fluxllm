@@ -147,3 +147,164 @@ class HFModelExecutor:
             raise RuntimeError(f"decode for unknown/stale sequence {state.request_id}")
         ids = self.torch.tensor([[last_token]], dtype=self.torch.long)
         return self._forward(state.request_id, ids, entry)
+
+    # -- batched execution ----------------------------------------------------
+    #
+    # Sequences in a scheduler iteration are packed into ONE forward per
+    # phase. KV tensors are gathered from per-sequence ``DynamicCache``s into
+    # a batched, left-padded batch (each row's real tokens occupy the
+    # trailing columns), position ids and attention masks are built per row,
+    # and the resulting per-row KV is sliced back out. Left-padding keeps the
+    # new token's append column identical for every row, so transformers'
+    # ``DynamicCache.update`` (which appends at a shared ``cache_position``)
+    # stays correct. Padded columns are zeroed in K/V and excluded by the
+    # attention mask, so they cannot influence any row's attention.
+
+    def _num_layers(self) -> int:
+        return int(self.model.config.num_hidden_layers)
+
+    def _entry_for(self, state: SequenceState) -> dict:
+        entry = self._caches.get(state.request_id)
+        if entry is None or entry["num_tokens"] != state.num_tokens:
+            raise RuntimeError(f"decode for unknown/stale sequence {state.request_id}")
+        return entry
+
+    def _row_cache(self, batched_cache: Any, row: int, start: int, length: int) -> Any:
+        """Slice one row's KV from a batched cache into a fresh per-seq cache."""
+        from transformers import DynamicCache
+
+        cache = DynamicCache()
+        for layer_idx in range(self._num_layers()):
+            layer = batched_cache.layers[layer_idx]
+            k = layer.keys[row : row + 1, :, start : start + length, :].clone()
+            v = layer.values[row : row + 1, :, start : start + length, :].clone()
+            cache.update(k, v, layer_idx)
+        return cache
+
+    def prefill_batch(self, prompts: Sequence[tuple[str, Sequence[int]]]) -> list[StepOutput]:
+        """Prefill several prompts in one forward (left-padded).
+
+        Callers must have validated the requests are not already prefilled;
+        this method validates all rows before any state is touched, so a
+        failure leaves no partial registrations behind.
+        """
+        torch = self.torch
+        if not prompts:
+            return []
+        for request_id, tokens in prompts:
+            if not tokens:
+                raise ValueError("prefill requires at least one token")
+            if len(tokens) > self._max_context_len:
+                raise ValueError("prompt exceeds model context length")
+            if request_id in self._caches:
+                raise RuntimeError(f"sequence {request_id} already prefilled")
+        bsz = len(prompts)
+        lengths = [len(tokens) for _, tokens in prompts]
+        max_prompt = max(lengths)
+        pad_id = int(
+            getattr(self.tokenizer, "pad_token_id", None)
+            or getattr(self.tokenizer, "eos_token_id", None)
+            or 0
+        )
+        ids = torch.full((bsz, max_prompt), pad_id, dtype=torch.long)
+        attention = torch.zeros((bsz, max_prompt), dtype=torch.long)
+        position_ids = torch.zeros((bsz, max_prompt), dtype=torch.long)
+        for row, (_, tokens) in enumerate(prompts):
+            n = len(tokens)
+            ids[row, max_prompt - n :] = torch.tensor(list(tokens), dtype=torch.long)
+            attention[row, max_prompt - n :] = 1
+            position_ids[row, max_prompt - n :] = torch.arange(n)
+        with torch.inference_mode():
+            outputs = self.model(
+                input_ids=ids.to(self.device),
+                attention_mask=attention.to(self.device),
+                position_ids=position_ids.to(self.device),
+                past_key_values=None,
+                use_cache=True,
+            )
+        past = outputs.past_key_values
+        results: list[StepOutput] = []
+        for row, (request_id, _tokens) in enumerate(prompts):
+            n = lengths[row]
+            entry = {
+                "hf_cache": self._row_cache(past, row, max_prompt - n, n),
+                "num_tokens": n,
+            }
+            self._caches[request_id] = entry
+            state = SequenceState(request_id=request_id, num_tokens=n, kv=entry)
+            results.append(
+                StepOutput(
+                    logits=outputs.logits[row, -1, :].float().detach().cpu().numpy(),
+                    state=state,
+                    context_exceeded=n >= self._max_context_len,
+                )
+            )
+        return results
+
+    def decode_batch(self, batch: Sequence[tuple[SequenceState, int]]) -> list[StepOutput]:
+        """Decode one token for several sequences in a single forward.
+
+        Every (state, last_token) row advances by exactly one position, the
+        same contract as N sequential :meth:`decode` calls; entries are only
+        written back after the whole forward succeeds, so a failure leaves
+        all per-sequence states untouched and callers can fall back to the
+        sequential path.
+        """
+        torch = self.torch
+        from transformers import DynamicCache
+
+        if not batch:
+            return []
+        entries = [self._entry_for(state) for state, _ in batch]
+        bsz = len(batch)
+        lengths = [entry["num_tokens"] for entry in entries]
+        max_len = max(lengths)
+        k0 = entries[0]["hf_cache"].layers[0].keys
+        dtype = k0.dtype
+        kv_heads, head_dim = int(k0.shape[1]), int(k0.shape[3])
+        num_layers = self._num_layers()
+        batched_cache = DynamicCache()
+        # Each layer gets its own padded gather: per-row real KV occupies the
+        # trailing columns and pad columns stay zero (attention-masked).
+        for layer_idx in range(num_layers):
+            padded_k = torch.zeros((bsz, kv_heads, max_len, head_dim), dtype=dtype)
+            padded_v = torch.zeros_like(padded_k)
+            for row, entry in enumerate(entries):
+                n = entry["num_tokens"]
+                layer = entry["hf_cache"].layers[layer_idx]
+                padded_k[row, :, max_len - n :, :] = layer.keys[0]
+                padded_v[row, :, max_len - n :, :] = layer.values[0]
+            batched_cache.update(padded_k, padded_v, layer_idx)
+        ids = torch.tensor([[last_token] for _, last_token in batch], dtype=torch.long)
+        attention = torch.zeros((bsz, max_len + 1), dtype=torch.long)
+        positions = torch.zeros((bsz, 1), dtype=torch.long)
+        for row, entry in enumerate(entries):
+            n = entry["num_tokens"]
+            # Real past tokens (trailing) plus the column of the new query.
+            attention[row, max_len - n :] = 1
+            positions[row, 0] = n
+        with torch.inference_mode():
+            outputs = self.model(
+                input_ids=ids.to(self.device),
+                attention_mask=attention.to(self.device),
+                position_ids=positions.to(self.device),
+                past_key_values=batched_cache,
+                use_cache=True,
+            )
+        past = outputs.past_key_values
+        results: list[StepOutput] = []
+        for row, (state, _last_token) in enumerate(batch):
+            entry = entries[row]
+            new_len = entry["num_tokens"] + 1
+            entry["hf_cache"] = self._row_cache(past, row, max_len - new_len + 1, new_len)
+            entry["num_tokens"] = new_len
+            self._caches[state.request_id] = entry
+            new_state = SequenceState(request_id=state.request_id, num_tokens=new_len, kv=entry)
+            results.append(
+                StepOutput(
+                    logits=outputs.logits[row, -1, :].float().detach().cpu().numpy(),
+                    state=new_state,
+                    context_exceeded=new_len >= self._max_context_len,
+                )
+            )
+        return results

@@ -91,3 +91,83 @@ async def test_hf_engine_concurrent_requests_release_blocks():
 async def _consume(handle) -> None:
     async for _event in handle.stream():
         pass
+
+
+def _make_executor():
+    from fluxllm.executor.hf_executor import HFModelExecutor
+
+    return HFModelExecutor(model_name=MODEL, dtype="float32", device="cpu")
+
+
+def test_hf_batched_decode_matches_sequential():
+    from fluxllm.executor.base import SequenceState
+
+    executor = _make_executor()
+    try:
+        prompts = ["The capital of France is", "The color of the sky is", "Two plus two is"]
+        seq_ids = [executor.encode(p) for p in prompts]
+        states = []
+        seq_streams: list[list[int]] = []
+        for i, pid in enumerate(seq_ids):
+            out = executor.prefill(str(i), pid)
+            states.append(out.state)
+            stream: list[int] = [int(out.logits.argmax())]
+            for _ in range(5):
+                out = executor.decode(states[i], stream[-1])
+                states[i] = out.state
+                stream.append(int(out.logits.argmax()))
+            seq_streams.append(stream[:5])
+        # batched: same prompts, same greedy argmax picks
+        executor.release("0")
+        executor.release("1")
+        executor.release("2")
+        b_states = [SequenceState(request_id=str(i), num_tokens=len(seq_ids[i])) for i in range(3)]
+        outs = executor.prefill_batch([(str(i), seq_ids[i]) for i in range(3)])
+        assert [o.state.num_tokens for o in outs] == [len(pid) for pid in seq_ids]
+        streams: list[list[int]] = []
+        for i, out in enumerate(outs):
+            b_states[i] = out.state
+            streams.append([int(out.logits.argmax())])
+        for _ in range(5):
+            outs = executor.decode_batch([(b_states[i], streams[i][-1]) for i in range(3)])
+            for i, out in enumerate(outs):
+                b_states[i] = out.state
+                streams[i].append(int(out.logits.argmax()))
+        for i in range(3):
+            assert streams[i][:5] == seq_streams[i], (
+                f"batched decode diverged for prompt {prompts[i]!r}: "
+                f"{streams[i][:5]} vs {seq_streams[i]}"
+            )
+    finally:
+        executor.release("0")
+        executor.release("1")
+        executor.release("2")
+
+
+def test_hf_batched_prefill_matches_sequential():
+
+    executor = _make_executor()
+    try:
+        prompts = ["Rainbows form when", "Turtles are reptiles that", "Gravity bends light near"]
+        ids = [executor.encode(p) for p in prompts]
+        outs = executor.prefill_batch([(str(i), ids[i]) for i in range(3)])
+        batched_argmax = [int(o.logits.argmax()) for o in outs]
+        # KV state lengths must line up for every row (checked while the
+        # batched rows are still registered)
+        for i in range(3):
+            entry = executor._caches.get(str(i))
+            assert entry is not None and entry["num_tokens"] == len(ids[i])
+            del executor._caches[str(i)]
+        executor.release("0")
+        executor.release("1")
+        executor.release("2")
+        sequential: list[int] = []
+        for i, pid in enumerate(ids):
+            out = executor.prefill(f"s{i}", pid)
+            sequential.append(int(out.logits.argmax()))
+            executor.release(f"s{i}")
+        assert batched_argmax == sequential, "batched prefill first-token logits diverged"
+    finally:
+        executor.release("0")
+        executor.release("1")
+        executor.release("2")

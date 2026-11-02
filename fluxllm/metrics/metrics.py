@@ -60,6 +60,12 @@ class EngineMetrics:
             "Continuous scheduling iterations executed",
             registry=self.registry,
         )
+        self.batched_forwards = Counter(
+            "fluxllm_batched_model_forwards",
+            "Model forwards that executed multiple sequences at once, with "
+            "the cumulative sequences-per-forward sum as the counter value",
+            registry=self.registry,
+        )
 
         # -- token counters ---------------------------------------------------
         self.prompt_tokens = Counter(
@@ -188,6 +194,11 @@ class EngineMetrics:
 
     def inc_preemptions(self) -> None:
         self.preemptions.inc()
+
+    def on_batched_forward(self, sequence_count: int) -> None:
+        """One model forward advanced ``sequence_count`` sequences at once."""
+        # Counter value doubles as total batched sequences executed.
+        self.batched_forwards.inc(sequence_count)
 
     # -- latency recording ---------------------------------------------------
     def record_ttft(self, timings: RequestTimings) -> None:

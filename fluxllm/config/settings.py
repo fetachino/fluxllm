@@ -33,6 +33,7 @@ class EngineSettings(BaseSettings):
     max_num_batched_tokens: int = 512  # prefill token budget per scheduler iteration
     max_queue_size: int = 128
     scheduler_policy: Literal["fifo", "longest_queue_first"] = "fifo"
+    enable_batched_execution: bool = True  # one forward per phase across sequences
 
     # KV cache --------------------------------------------------------------
     block_size: int = 16  # tokens per logical block
